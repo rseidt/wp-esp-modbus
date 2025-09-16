@@ -23,9 +23,13 @@
 #include "log.h"
 
 #include <WiFiClientSecure.h>
+#if defined(ARDUINO_ARCH_ESP32)
+#include <ArduinoHttpClient.h>
+#include <HTTPUpdate.h>
+#else
 #include <ESP8266HTTPClient.h>
 #include <ESP8266httpUpdate.h>
-
+#endif
 #include <Url.h>
 
 static const char *VERSION_HEADER = "X-Object-Meta-Version";
@@ -71,9 +75,10 @@ bool _httpRequest(HTTPClient *http_client, const String& url_s) {
   return false;
 }
 
-String _requestFirmwareVersion(const String &url_s) {
+String remote_version;
+
+void _requestFirmwareVersion(const String &url_s) {
   log(LOG_LEVEL_INFO, "Requesting firmware from url=" + String(url_s));
-  String firmware_version = "";
   HTTPClient client;
   const char* headers_list[] = { VERSION_HEADER, "Content-Type" };
   client.collectHeaders(headers_list, sizeof(headers_list)/sizeof(headers_list[0]));
@@ -81,19 +86,22 @@ String _requestFirmwareVersion(const String &url_s) {
     log(LOG_LEVEL_INFO, "Header "+String(VERSION_HEADER)+"="+String(client.header(VERSION_HEADER)));
     log(LOG_LEVEL_INFO, "Header Content-Type=" + String(client.header("Content-Type")));
     if (client.header("Content-Type") == "application/octet-stream") {
-      firmware_version = client.header(VERSION_HEADER);
+      remote_version = client.header(VERSION_HEADER);
     } else {
-      log(LOG_LEVEL_ERROR, "Invalid Content-Type: " + String(client.header("Content-Type")));
+      log(LOG_LEVEL_ERROR, "Invalid Content-Type: " + client.header("Content-Type"));
+      remote_version = "";
     }
   }
+  log(LOG_LEVEL_INFO, "Firmware version -> " + remote_version);
   client.end();
-  return firmware_version;
+  log(LOG_LEVEL_INFO, "Connection closed.");
 }
 
 bool checkFirmwareUpdate(const String& url_s, const String& current_version) {
   log(LOG_LEVEL_INFO, "Checking firmware version="+String(current_version)+" from url=" + String(url_s));
 
-  const String remote_version = _requestFirmwareVersion(url_s);
+  _requestFirmwareVersion(url_s);
+  log(LOG_LEVEL_INFO, "Remote firmware version returned: " + remote_version);
   if (remote_version.isEmpty()) {
     log(LOG_LEVEL_WARNING, "Remote firmware not found");
   } else if (remote_version > current_version) {

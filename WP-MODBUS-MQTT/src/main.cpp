@@ -17,14 +17,11 @@
 */
 
 #include "main.h"
-#include "setupWifiManager.h"
-#include "setupReconfigureServer.h"
 
 
 const int MODBUS_SCANRATE = 2;  // in seconds
 
-
-static char HOSTNAME[24] = "ESP-MM-FFFFFFFFFFFFFFFF";
+static char HOSTNAME[18] = "ESP-MM-FFFFFFFFFF";
 static const char __attribute__((__unused__)) *TAG = "Main";
 
 // static const char *FIRMWARE_URL = "https://domain.com/path/file.bin";
@@ -39,6 +36,8 @@ Timer<1,millis> wifi_reconnect_timer;
 Timer<1,millis> modbus_poller_timer;
 Timer<1,millis> memory_report_timer;
 bool modbus_poller_inprogress = false;
+bool modbus_poller_paused = false;
+ulong modbus_poller_paused_millis = 0;
 bool wifiConnected = false;
 bool mqttConnected = false;
 
@@ -46,7 +45,7 @@ int freeHeap;
 
 void startModbusPoller()
 {
-  modbus_poller_timer.every(2000, runModbusPollerTask);
+  modbus_poller_timer.every(100, runModbusPollerTask);
 }
 
 void stopModbusPoller(){
@@ -129,7 +128,11 @@ bool connectToMqtt(void * pvParameters) {
 void wiFiEvent(WiFiEvent_t event) {
   log(LOG_LEVEL_INFO, "WiFi event: " + event);
   switch (event) {
+#ifdef ARDUINO_ARCH_ESP32
+    case arduino_event_id_t::ARDUINO_EVENT_WIFI_STA_GOT_IP:
+#else
     case WIFI_EVENT_STAMODE_GOT_IP:
+#endif
       log(LOG_LEVEL_INFO, "WiFi connected with IP address: " + WiFi.localIP().toString());
       if (!MDNS.begin(HOSTNAME)) {  // init mdns
         log(LOG_LEVEL_WARNING, "Error setting up MDNS responder");
@@ -143,7 +146,11 @@ void wiFiEvent(WiFiEvent_t event) {
       }
       startMqttConnectTimer();
       break;
+#ifdef ARDUINO_ARCH_ESP32
+    case arduino_event_id_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+#else
     case WIFI_EVENT_STAMODE_DISCONNECTED:
+#endif
       log(LOG_LEVEL_INFO, "WiFi lost connection");
       stopMqttConnectTimer();  // ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
       startWifiConnectTimer();
@@ -184,20 +191,16 @@ void onMqttUnsubscribe(uint16_t packetId) {
 
 void onMqttMessage(char *topic, char *payload,
   AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
-  log(LOG_LEVEL_INFO, "Message received (topic="+String(topic)+", qos="+String(properties.qos)+", dup="+String(properties.dup)+", retain="+String(properties.retain)+", len="+String(len)+", index="+String(index)+", total="+String(total)+"): " + String(payload));
+  log(LOG_LEVEL_INFO, "Message received (topic="+String(topic)+", qos="+String(properties.qos)+", dup="+String(properties.dup)+", retain="+String(properties.retain)+", len="+String(len)+", index="+String(index)+", total="+String(total)+"): " + String(payload,total));
 
   String suffix = String(topic).substring(strlen(param_mqtt_topic) + strlen(HOSTNAME) + 9);
           // substring(1 + strlen(MQTT_TOPIC) + strlen("/") + strlen(HOSTNAME) + strlen("/") + strlen("action"))
   log(LOG_LEVEL_INFO, "MQTT topic suffix=" + String(suffix.c_str()));
 
-  if (suffix == "upgrade") {
-    log(LOG_LEVEL_INFO, "MQTT OTA update requested");
-    runOtaUpdateTask();
-    return;
-  } else if (suffix == "write_register") {
+  if (suffix == "write_register") {
     log(LOG_LEVEL_INFO, "MQTT Write modbus register requested");
     stopModbusPoller();
-    String payload_s = String(payload);
+    String payload_s = String(payload,total);
     String register_name = payload_s.substring(0, payload_s.indexOf('='));
     String register_value = payload_s.substring(payload_s.indexOf('=') + 1);
     log(LOG_LEVEL_INFO, "Writing register name="+String(register_name)+" with value="+String(register_value));
@@ -218,28 +221,6 @@ void onMqttPublish(uint16_t packetId) {
   log(LOG_LEVEL_INFO, "Publish acknowledged for packetId: " + String(packetId));
 }
 
-void runOtaUpdateTask() {
-  log(LOG_LEVEL_INFO, "Entering OTA task.");
-
-    log(LOG_LEVEL_INFO, "Checking if new firmware is available");
-    if (checkFirmwareUpdate(param_firmware_url, FIRMWARE_VERSION)) {
-      log(LOG_LEVEL_WARNING, "New firmware found");
-      log(LOG_LEVEL_INFO, "Suspending modbus poller");
-      modbus_poller_timer.cancel();
-      modbus_poller_inprogress = false;
-
-      if (updateOTA(param_firmware_url)) {
-        // Update is done. Rebooting...
-        log(LOG_LEVEL_INFO, "Rebooting.");
-        log(LOG_LEVEL_INFO, "************************ REBOOT IN PROGRESS *************************");
-        ESP.restart();
-      } else {
-        log(LOG_LEVEL_ERROR, "OTA update failed. Restarting Modbus Poller");
-// TODO(gmasse): retry?
-        startModbusPoller();
-      }
-    }
-  }
 
 bool runModbusPollerTask(void * pvParameters) {
 #ifndef MODBUS_DISABLED
@@ -250,21 +231,28 @@ bool runModbusPollerTask(void * pvParameters) {
       return true;
     }
     modbus_poller_inprogress = true;
-
-    JsonDocument json_doc;  // instanciate JSON storage
-    parseModbusToJson(json_doc);
-    size_t json_size = measureJson(json_doc) +1;
-    char *buffer = (char*)malloc(json_size * sizeof(char));
-    size_t n = serializeJson(json_doc, buffer, json_size);
-    log(LOG_LEVEL_INFO, "JSON serialized: " + String(buffer));
-    if (mqtt_client.connected()) {
-      String mqtt_complete_topic = param_mqtt_topic;
-      mqtt_complete_topic += "/" + String(HOSTNAME) + "/data";
-      log(LOG_LEVEL_INFO, "MQTT Publishing data to topic: " + String(mqtt_complete_topic.c_str()));
-      mqtt_client.publish(mqtt_complete_topic.c_str(), 0, true, buffer, n);
+    if (fillRegisterValues()) { // returns true if completed
+      JsonDocument json_doc;  // instanciate JSON storage
+      writeRegisterValuesToJson(json_doc);
+      size_t json_size = measureJson(json_doc) +1;
+      log(LOG_LEVEL_INFO, "JSON size: " + String(json_size) + " bytes");
+      char *buffer = (char*)malloc(json_size * sizeof(char));
+      size_t n = serializeJson(json_doc, buffer, json_size);
+      log(LOG_LEVEL_INFO, "JSON serialized: " + String(buffer));
+      if (mqtt_client.connected()) {
+        String mqtt_complete_topic = param_mqtt_topic;
+        mqtt_complete_topic += "/" + String(HOSTNAME) + "/data";
+        log(LOG_LEVEL_INFO, "MQTT Publishing data to topic: " + String(mqtt_complete_topic.c_str()));
+        mqtt_client.publish(mqtt_complete_topic.c_str(), 0, true, buffer, n);
+      }
+      free(buffer);
+      modbus_poller_paused = true;
+      modbus_poller_paused_millis = millis();
+      log(LOG_LEVEL_INFO, "Pausing Modbus poller for "+String(MODBUS_SCANRATE)+" seconds to allow other Modbus masters to communicate.");
+      stopModbusPoller();
     }
-    free(buffer);
     modbus_poller_inprogress = false;
+
 #endif  // MODBUS_DISABLED
 return true;
 }
@@ -279,11 +267,11 @@ void setup() {
   log(LOG_LEVEL_INFO, "Serial started at 74880 baud");
 
   setupWifiManager(false);
-  setupReconfigureServer();
+  setupWebserver();
 
 
 
-  snprintf(HOSTNAME, sizeof(HOSTNAME), "ESP-MM-%i", ESP.getChipId());  // setting hostname
+  snprintf(HOSTNAME, sizeof(HOSTNAME), "ESP-MM-%llX", ESP.getEfuseMac());
 
   log(LOG_LEVEL_INFO, "*********************************************************************");
   log(LOG_LEVEL_INFO, "Firmware version "+String(FIRMWARE_VERSION)+" (compiled at "+__DATE__+" "+__TIME__+")");
@@ -313,10 +301,19 @@ void setup() {
 }
 int i = 0;
 void loop() {
-  loopReconfigureServer();
+  loopWebserver();
   //log(4, "Entering main loop : "+String(i++));
   wifi_reconnect_timer.tick();
   mqtt_reconnect_timer.tick();
   modbus_poller_timer.tick();
+  // if Modbus poller is paused, check if we can restart it
+  int actualMillis = millis() - modbus_poller_paused_millis;
+  int pauseMillis = MODBUS_SCANRATE * 1000;
+  if (modbus_poller_paused && (actualMillis > pauseMillis)) {
+    log(LOG_LEVEL_INFO, "Modbus poller pause time elapsed ("+String(actualMillis)+" milliseconds since paused). Pause millis wanted: " + String(pauseMillis));
+    log(LOG_LEVEL_INFO, "Resuming Modbus poller after pause of "+String(MODBUS_SCANRATE)+" seconds.");
+    modbus_poller_paused = false;
+    startModbusPoller();
+  }
   memory_report_timer.tick();
 }

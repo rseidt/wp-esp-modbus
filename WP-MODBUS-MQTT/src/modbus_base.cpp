@@ -19,9 +19,13 @@
 #include "modbus_base.h"
 
 // TODO: add this to WifiManager
-
-#define RXD 14 // aka D5
-#define TXD 12 // aka D6
+#ifdef ARDUINO_ARCH_ESP32
+  #define RXD 16 // aka D5
+  #define TXD 17 // aka D6
+#else
+  #define RXD 14 // aka D5
+  #define TXD 12 // aka D6
+#endif
 #define RTS NOT_A_PIN
 
 #define MODBUS_BAUDRATE 9600
@@ -32,10 +36,20 @@
 // instantiate ModbusMaster object
 ModbusMaster modbus_client;
 
+uint16_t* register_values; // array to hold the register values
+int num_registers = sizeof(registers) / sizeof(modbus_register_t);
+int currentRegisterIndex = 0;
+int currentTryIndex = 0;
+
+bool modbus_poller_task_running = false;
+
 // The ESP32 has 3 hardware serial ports, the ESP8266 has only 1 which we use for debugging.
 // So we do the modbus communication over Software Serial.
-SoftwareSerial swSerial(RXD, TXD); // RX, TX
-
+#ifdef ARDUINO_ARCH_ESP32
+  HardwareSerial modbusSerial(2); // Use UART2
+#else
+  SoftwareSerial modbusSerial(RXD, TXD); // RX, TX
+#endif
 void preTransmission() {
   digitalWrite(RTS, 1);
 }
@@ -46,9 +60,10 @@ void postTransmission() {
 
 void initModbus() {
 
-  swSerial.begin(9600);  // Using ESP32 UART2 for Modbus
-  modbus_client.begin(MODBUS_UNIT, swSerial);
-
+  register_values = new uint16_t[num_registers];
+  modbusSerial.begin(9600);  // Using ESP32 UART2 for Modbus
+  modbus_client.begin(MODBUS_UNIT, modbusSerial);
+  
   // do we have a flow control pin?
   if (RTS != NOT_A_PIN) {
     // Init in receive mode
@@ -128,32 +143,53 @@ bool writeModbusRegister(const char* register_name, uint16_t value) {
 
 bool getModbusValue(uint16_t register_id, modbus_entity_t modbus_entity, uint16_t *value_ptr) {
   log(LOG_LEVEL_INFO, "Requesting data");
-  for (uint8_t i = 1; i <= MODBUS_RETRIES + 1; ++i) {
-    log(LOG_LEVEL_INFO, "Trial "+String(i)+"/"+String(MODBUS_RETRIES+1));
-    switch (modbus_entity) {
-      case MODBUS_TYPE_HOLDING:
-        uint8_t result;
-        result = modbus_client.readHoldingRegisters(register_id, 1);
-        if (getModbusResultMsg(&modbus_client, result)) {
-          *value_ptr = modbus_client.getResponseBuffer(0);
-          log(LOG_LEVEL_INFO, "Data read: " + String(*value_ptr));
-          return true;
-        } else {
-          log(LOG_LEVEL_ERROR, "Error reading data from register ID: " + String(register_id) + ". Tried "+String(i)+" of "+String(MODBUS_RETRIES+1) + " times.");
-        }
-        break;
-      default:
-        log(LOG_LEVEL_ERROR, "Unsupported Modbus entity type");
-        value_ptr = nullptr;
-        return false;
-        break;
-    }
+  switch (modbus_entity) {
+    case MODBUS_TYPE_HOLDING:
+      uint8_t result;
+      result = modbus_client.readHoldingRegisters(register_id, 1);
+      if (getModbusResultMsg(&modbus_client, result)) {
+        *value_ptr = modbus_client.getResponseBuffer(0);
+        log(LOG_LEVEL_INFO, "Data read: " + String(*value_ptr));
+        return true;
+      }
+      break;
+    default:
+      log(LOG_LEVEL_ERROR, "Unsupported Modbus entity type");
+      break;
   }
-  // Time-out
-  log(LOG_LEVEL_ERROR, "Time-out after "+String(MODBUS_RETRIES+1)+" trials");
   value_ptr = nullptr;
   return false;
 }
+
+bool fillRegisterValues(){
+    uint16_t raw_value;
+    log(LOG_LEVEL_INFO, "Filling register "+String(registers[currentRegisterIndex].name)+" (index "+String(currentRegisterIndex)+"/"+String(num_registers-1)+"); quantity of tries: "+String(currentTryIndex+1)+"/"+String(MODBUS_RETRIES+1));
+    if (getModbusValue(registers[currentRegisterIndex].id, registers[currentRegisterIndex].modbus_entity, &raw_value)) {
+      register_values[currentRegisterIndex] = raw_value;
+      log(LOG_LEVEL_INFO, "Filled register "+String(registers[currentRegisterIndex].name)+" with value "+String(raw_value));
+      currentTryIndex = 0;
+      currentRegisterIndex++;
+    } else {
+      log(LOG_LEVEL_ERROR, "Failed to read register "+String(registers[currentRegisterIndex].name));
+      if (currentTryIndex < MODBUS_RETRIES) {
+        currentTryIndex++;
+      } else {
+        log(LOG_LEVEL_ERROR, "Max retries reached for register "+String(registers[currentRegisterIndex].name)+". Moving to next register.");
+        register_values[currentRegisterIndex] = 0xFFFF; // indicate failure
+        currentTryIndex = 0;
+        currentRegisterIndex++;
+      }
+    }
+    if (currentRegisterIndex < num_registers)
+    {
+      return false;
+    } else {
+      currentRegisterIndex = 0;
+      currentTryIndex = 0;
+      return true;
+    }
+  }
+
 
 String toBinary(uint16_t input) {
     String output;
@@ -181,27 +217,21 @@ bool decodeDiematicDecimal(uint16_t int_input, int8_t decimals, float *value_ptr
   }
 }
 
-void readModbusRegisterToJson(uint16_t register_id, ArduinoJson::JsonVariant variant) {
+void writeRegisterValuesToJson(ArduinoJson::JsonVariant variant) {
   // searchin for register matching register_id
-  const uint8_t item_nb = sizeof(registers) / sizeof(modbus_register_t);
-  for (uint8_t i = 0; i < item_nb; ++i) {
-    if (registers[i].id != register_id) {
-      // not this one
-      continue;
-    } else {
+  for (uint8_t i = 0; i < num_registers; ++i) {
       // register found
       log(LOG_LEVEL_INFO, "Register id="+String(registers[i].id)+" type=0x"+String(registers[i].type)+" name=" + String(registers[i].name));
-      uint16_t raw_value;
-      if (getModbusValue(registers[i].id, registers[i].modbus_entity, &raw_value)) {
-        log(LOG_LEVEL_INFO, "Raw value: "+String(registers[i].name)+"="+String(raw_value));
+      if (register_values[i] != 0xFFFF) {
+        log(LOG_LEVEL_INFO, "Raw value: "+String(registers[i].name)+"="+String(register_values[i]));
         switch (registers[i].type) {
           case REGISTER_TYPE_U16:
-            log(LOG_LEVEL_INFO, "Value: " + String(raw_value));
-            variant[registers[i].name] = raw_value;
+            log(LOG_LEVEL_INFO, "Value: " + String(register_values[i]));
+            variant[registers[i].name] = register_values[i];
             break;
           case REGISTER_TYPE_DIEMATIC_ONE_DECIMAL:
             float final_value;
-            if (decodeDiematicDecimal(raw_value, 1, &final_value)) {
+            if (decodeDiematicDecimal(register_values[i], 1, &final_value)) {
               log(LOG_LEVEL_INFO, "Value: "+String(final_value));
               variant[registers[i].name] = final_value;
             } else {
@@ -215,13 +245,13 @@ void readModbusRegisterToJson(uint16_t register_id, ArduinoJson::JsonVariant var
                 log(LOG_LEVEL_INFO, " [bit"+String(j)+"] end of bitfield reached");
                 break;
               }
-              const uint8_t bit_value = raw_value >> j & 1;
+              const uint8_t bit_value = register_values[i] >> j & 1;
               log(LOG_LEVEL_INFO, " [bit"+String(j)+"] "+String(bit_varname)+"=" + String(bit_value));
               variant[bit_varname] = bit_value;
             }
             break;
           case REGISTER_TYPE_DEBUG:
-            log(LOG_LEVEL_INFO, "Raw DEBUG value: "+String(registers[i].name)+"=" + String(raw_value) + " (0b" + toBinary(raw_value) + ")");
+            log(LOG_LEVEL_INFO, "Raw DEBUG value: "+String(registers[i].name)+"=" + String(register_values[i]) + " (0b" + toBinary(register_values[i]) + ")");
             break;
           default:
             log(LOG_LEVEL_ERROR, "Unsupported register type");
@@ -230,15 +260,5 @@ void readModbusRegisterToJson(uint16_t register_id, ArduinoJson::JsonVariant var
       } else {
         log(LOG_LEVEL_ERROR, "Request failed!");
       }
-      return;
     }
   }
-}
-
-void parseModbusToJson(ArduinoJson::JsonVariant variant) {
-  log(LOG_LEVEL_INFO, "Parsing all Modbus registers");
-  uint8_t item_nb = sizeof(registers) / sizeof(modbus_register_t);
-  for (uint8_t i = 0; i < item_nb; ++i) {
-    readModbusRegisterToJson(registers[i].id, variant);
-  }
-}

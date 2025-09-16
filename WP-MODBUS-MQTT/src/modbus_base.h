@@ -21,7 +21,9 @@
 
 #include <ModbusMaster.h>
 #include <ArduinoJson.h>
+#ifndef ARDUINO_ARCH_ESP32
 #include <SoftwareSerial.h>
+#endif
 #include "modbus_registers.h"
 #include "log.h"
 #include "Arduino.h"
@@ -29,8 +31,7 @@
 void preTransmission();
 void postTransmission();
 void initModbus();
-void readModbusRegisterToJson(uint16_t register_id, ArduinoJson::JsonVariant variant);
-void parseModbusToJson(ArduinoJson::JsonVariant variant);
 bool writeModbusRegister(const char* register_name, uint16_t value);
-
+bool fillRegisterValues();
+void writeRegisterValuesToJson(ArduinoJson::JsonVariant variant);
 #endif  // SRC_MODBUS_BASE_H_

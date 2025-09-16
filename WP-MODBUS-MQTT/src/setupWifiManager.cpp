@@ -7,6 +7,7 @@ char param_mqtt_port[6] = "8080";
 char param_firmware_url[255] = "http://url/firmware.bin";
 char param_mqtt_topic[50] = "esp/modbus";
 
+#define FORMAT_LITTLEFS_IF_FAILED true
 
 //flag for saving data
 bool shouldSaveConfig = false;
@@ -36,42 +37,40 @@ void setupWifiManager(bool forceConfigPortal) {
 
     //read configuration from FS json
     log(LOG_LEVEL_INFO,"mounting FS...");
-
-    if (LittleFS.begin()) {
-        log(LOG_LEVEL_INFO,"mounted file system");
-        if (LittleFS.exists("/config.json")) {
-            //file exists, reading and loading
-            log(LOG_LEVEL_INFO,"reading config file");
-            File configFile = LittleFS.open("/config.json", "r");
-            if (configFile) {
-                log(LOG_LEVEL_INFO,"opened config file");
-                size_t size = configFile.size();
-                log(LOG_LEVEL_INFO,"Size: " + String(size));
-                // Allocate a buffer to store contents of the file.
-                std::unique_ptr<char[]> buf(new char[size]);
-
-                configFile.readBytes(buf.get(), size);
-                JsonDocument json;
-                auto deserializeError = deserializeJson(json, buf.get());
-                serializeJson(json, Serial);
-                if ( ! deserializeError ) {
-
-                    log(LOG_LEVEL_INFO,"\nparsed json");
-                    strcpy(param_mqtt_server, json["mqtt_server"]);
-                    strcpy(param_mqtt_port, json["mqtt_port"]);
-                    strcpy(param_firmware_url, json["firmware_url"]);
-                    strcpy(param_mqtt_topic, json["mqtt_topic"]);
-                } else {
-                    log(LOG_LEVEL_ERROR,"failed to load json config");
-                }
-                configFile.close();
-                
-            }
-        }
-        LittleFS.end();
-    } else {
-        log(LOG_LEVEL_ERROR, "failed to mount FS");
+    if(!LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED)){
+        log(LOG_LEVEL_ERROR, "LittleFS Mount Failed");
+        return;
     }
+
+    log(LOG_LEVEL_INFO,"mounted file system");
+    //file exists, reading and loading
+    log(LOG_LEVEL_INFO,"reading config file");
+    File configFile = LittleFS.open("/config.json", "r");
+    if (configFile) {
+        log(LOG_LEVEL_INFO,"opened config file");
+        size_t size = configFile.size();
+        log(LOG_LEVEL_INFO,"Size: " + String(size));
+        // Allocate a buffer to store contents of the file.
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        configFile.readBytes(buf.get(), size);
+        JsonDocument json;
+        auto deserializeError = deserializeJson(json, buf.get());
+        serializeJson(json, Serial);
+        if ( ! deserializeError ) {
+
+            log(LOG_LEVEL_INFO,"\nparsed json");
+            strcpy(param_mqtt_server, json["mqtt_server"]);
+            strcpy(param_mqtt_port, json["mqtt_port"]);
+            strcpy(param_firmware_url, json["firmware_url"]);
+            strcpy(param_mqtt_topic, json["mqtt_topic"]);
+        } else {
+            log(LOG_LEVEL_ERROR,"failed to load json config");
+        }
+        configFile.close();
+        
+    }
+    LittleFS.end();
   //end read
 
   // The extra parameters to be configured (can be either global or just in the setup)
