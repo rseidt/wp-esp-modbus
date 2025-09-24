@@ -6,11 +6,11 @@
 #define LOG_LEVEL_INFO 3
 #define LOG_LEVEL_DEBUG 4
 
-#define MAX_LOG_LEVEL 4 // Change this to set the maximum log level
+#define MAX_LOG_LEVEL 2 // Change this to set the maximum log level
 
 #include "Arduino.h"
 #include "modbus_registers.h"
 
 void log(int16_t level, const String &message_s);
 
-#endif  // SRC_LOG_H_
+#endif // SRC_LOG_H_

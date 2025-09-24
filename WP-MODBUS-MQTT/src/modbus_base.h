@@ -31,7 +31,7 @@
 void preTransmission();
 void postTransmission();
 void initModbus();
-bool writeModbusRegister(const char* register_name, uint16_t value);
+bool writeModbusRegister(const char *register_name, uint16_t value);
 bool fillRegisterValues();
 void writeRegisterValuesToJson(ArduinoJson::JsonVariant variant);
-#endif  // SRC_MODBUS_BASE_H_
+#endif // SRC_MODBUS_BASE_H_

@@ -19,7 +19,7 @@
 #ifndef SRC_MAIN_H_
 #define SRC_MAIN_H_
 
-//#define MODBUS_DISABLED  // comment this line to enable Modbus functions
+// #define MODBUS_DISABLED  // comment this line to enable Modbus functions
 
 #include <math.h>
 #if defined(ARDUINO_ARCH_ESP32)
@@ -37,7 +37,6 @@
 #include <arduino-timer.h>
 #include <Url.h>
 #include "log.h"
-//#include "esp_base.h"
 #include "setupWebserver.h"
 #include "setupWifiManager.h"
 
@@ -45,8 +44,9 @@
 #include <modbus_base.h>
 #endif
 void runOtaUpdateTask();
-bool runModbusPollerTask(void * pvParameters);
-bool connectToWifi(void * pvParameters);
-bool connectToMqtt(void * pvParameters);
+bool runModbusPollerTask(void *pvParameters);
+bool connectToWifi(void *pvParameters);
+bool connectToMqtt(void *pvParameters);
+bool reportMemoryStatus(void *pvParameters);
 
-#endif  // SRC_MAIN_H_
+#endif // SRC_MAIN_H_
