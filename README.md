@@ -47,10 +47,21 @@ Network password: `password`
 
 ---
 
+If your browser does not open the captive portal automatically just navigate to `http://192.168.4.1`.
+
 Here you have the options to configure your WiFi the board should connect to, as well as the following settings:
 - MQTT host
 - MQTT port
 - MQTT base topic
+
+
+> [!IMPORTANT]
+> You will only by able to connect to WiFi Networks running on 2.4 GHz.
+
+Once configured the configuration network will not show up again. Only if wifi connection fails at startup. To bring up the Configuration Network again, navigate to the ip adress provided to your board by your local Network. For example:
+
+`http://192.168.0.123` but this depends on which IP address was provided by your Router/DHCP Server.
+
 
 ### Configuring relevant registers
 
