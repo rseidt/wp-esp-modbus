@@ -67,7 +67,7 @@ const modbus_register_t registers[] = {
 };
 ```
 
-### Configuring Address and Baus Rate
+### Configuring Address and Baud Rate
 
 in `modbus_base.h` you can set the Modbus SalveID and the Modbus Baud Rate:
 
@@ -119,4 +119,4 @@ Example:
 temp_soll_heiz=22
 ```
 
-If the slave accepts it, it will reflect in the data document ithin the next polling interval (usually 2 seconds)
+If the slave accepts it, it will reflect in the data document within the next polling interval (usually 2 seconds)
