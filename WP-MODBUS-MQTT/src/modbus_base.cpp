@@ -1,20 +1,5 @@
 #include "modbus_base.h"
 
-// TODO: add this to WifiManager
-#ifdef ARDUINO_ARCH_ESP32
-#define RXD 16 // aka D5
-#define TXD 17 // aka D6
-#else
-#define RXD 14 // aka D5
-#define TXD 12 // aka D6
-#endif
-#define RTS NOT_A_PIN
-
-#define MODBUS_BAUDRATE 9600
-#define MODBUS_UNIT 1
-#define MODBUS_RETRIES 2
-#define MODBUS_SCANRATE 10 // in seconds
-
 // instantiate ModbusMaster object
 ModbusMaster modbus_client;
 
