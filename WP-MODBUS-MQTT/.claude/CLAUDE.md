@@ -1,0 +1,151 @@
+# Pool-Wärmepumpe „Evolution Aqua" — ESP32 Modbus/MQTT-Bridge
+
+Projektkontext für Claude Code. Übernommen aus einer vorangegangenen Konversation in der Claude-Chat-Oberfläche.
+
+## Ziel des Projekts
+
+Eine selbstgebaute ESP32-basierte Modbus-RTU/MQTT-Bridge, die eine günstige „Evolution Aqua" Pool-Wärmepumpe lokal steuerbar und auslesbar macht (statt nur über Tuya-Cloud/App). Arduino-Code ist selbst geschrieben, Register wurden per Reverse Engineering ermittelt.
+
+## Hardware
+
+- **Wärmepumpe:** „Evolution Aqua" (Markenname außen)
+- **Controller-Board:** OEM/Whitelabel, Aufdruck `SP.KYZ1.5-4.1`. Mit hoher Wahrscheinlichkeit ein Fairland/AquaForte/SPRSUN-Klon auf Tuya-Plattform.
+- **Bus:** RS485, Anschlussbuchse mit Belegung `12V- / 12V+ / A / B` (Signalleitungen A und B; G/Masse und +12V Versorgung). Zweite RS485-Buchse auf der Platine liegt physisch **parallel** zum selben Bus.
+- **ESP32:** hängt als zweiter Modbus-Master am selben A/B-Paar.
+
+## Bus-Topologie (wichtig!)
+
+- Modbus RTU ist ein **Single-Master-Protokoll**. Am Bus hängen effektiv zwei Master:
+  1. Das **Bedien-Display** (Master-Einheit, enthält integriertes Tuya WBR3 WiFi-Modul). Steckt an der 12V/A/B-Buchse.
+  2. Der **ESP32** (unsere Bridge).
+- Der eigentliche **Slave** ist die Wärmepumpen-Hauptplatine (Kompressor, Sensoren, Ventile).
+- **Symptom:** ESP32 funktioniert einwandfrei, solange die Hersteller-App geschlossen ist. Display allein stört NICHT (pollt nicht aggressiv über A/B). Sobald die App das Tuya-Modul aufweckt, kollidieren die Anfragen → ESP32 bekommt „Invalid Slave ID" (verstümmelte Antwortframes durch Buskollision).
+
+## Lösung des Master-Konflikts: WBR3 deaktivieren
+
+Da auf die App verzichtet werden kann (Steuerung künftig über MQTT/Home Assistant), wird das Tuya-Modul stillgelegt. Damit ist der ESP32 alleiniger aktiver Master.
+
+- Das WiFi-Modul ist ein **Tuya WBR3** (FCC-ID 2ANDL-WBR3), sitzt auf der **Display-Platine** (nicht separat ausbaubar ohne LCD-Risiko).
+- **Fix:** WBR3 **EN-Pin (Pin 3)** dauerhaft auf **GND (Pin 9)** ziehen (Drahtbrücke).
+  - EN ist active-high und extern per Pull-up hochgezogen → muss aktiv auf GND gezogen werden, „abknipsen" reicht nicht.
+  - Pin 3 liegt am Modulrand (3. Pin von einem Ende), gut erreichbar. Pin 9 (GND) liegt gegenüber.
+  - Verbrauch im disabled-Zustand: ~1,5 µA → Modul komplett stumm.
+  - Modul NICHT auslöten (LCD-Beschädigungsgefahr). Modul bleibt stecken.
+  - Kein SMD-Rework nötig: Feinlötkolben (1–2 mm Spitze), dünner Draht (Kynar/Litze), Drahtbrücke Pin3→Pin9.
+  - **Reversibel** möglich: kleinen Schalter/Jumper zwischen EN und GND statt fester Brücke.
+- Pin 1 vorher eindeutig identifizieren (Markierung/abgeschrägte Ecke). Bei Modulvariante (WBR3N/WBR3L/WB3S) Pinbelegung gegenprüfen.
+- **Risiko-Hinweis:** Ohne WBR3-Deaktivierung kann zudem der AMS1117-Spannungsregler auf der Platine überlastet werden.
+
+## Register-Mapping (Reverse Engineered)
+
+Die Modbus-Holding-Register sind eine **Spiegelung der Tuya-Datapoint-(DP-)IDs**. Setpoints zeigen ein **+5-Offset** zur DP-ID. **Skalierung der Temperaturen: roher Wert ÷ 10 = °C.**
+
+### Bestätigte Holding-Register (0-Basiert)
+| Modbus-Adr | Funktion | Tuya-DP | Skalierung/Werte |
+|---|---|---|---|
+| 39 | Status-Bitmap | – (zusammengesetzt) | Bit 0 = Wasserpumpe, Bit 1 = Kompressor läuft („Running" vs. „Standby"), Bit 3 = 4-Wege-Ventil/Magnetventil (vermutet), Bits 4+5 = Heizmodus aktiv. Typische Werte: 0=Aus, 1=nur Wasserpumpe, 49=Heat-Modus idle/Standby, 59=Heat-Modus aktiv heizend |
+| 47 | Wassertemperatur (Spiegel von Reg 51) | (DP16-Spiegel) | ÷10 °C, identisch zu Reg 51 in allen Scans |
+| 50 | Wassertemperatur aktuell | DP16 (temp_current) | ÷10 °C (212 → 21,2 °C). Bestätigt via Kreuzvergleich (Aus: 21,5 °C kalt, Heizbetrieb: 22,8–25,2 °C) |
+| 92 | Ein/Aus | DP1 (switch) | bool 0/1 |
+| 93 | Modus | DP2 (mode) | 2=Heat, 0=Auto, 1=Cool (in allen Scans 2, da nur Heizbetrieb getestet) |
+| 105 | Solltemperatur Heizen | DP101 (set_heating_temp) | °C, Bereich 5–55, in Scans als ganze °C (24, 28 — nicht ×10!). Achtung: Skalierung weicht von DP-Definition ab |
+| 106 | Solltemperatur Kühlen | DP102 (set_cold_temp) | °C, Bereich 5–35 (vermutet, in Scans = 27) |
+| 108 | Solltemperatur Auto | DP104 (set_auto_temp) | °C, Bereich 5–40 (vermutet, in Scans = 30) |
+| 132 | Sub-Mode (Boost/Eco/Silent) | DP117 (frequency) | 0=Silent(?), 1=Eco/Smart, 2=Boost/Powerful |
+
+### Status-Bitmap Reg 39 — Beobachtete Werte
+| Zustand | Reg 39 dez | binär | Interpretation |
+|---|---|---|---|
+| Pumpe komplett aus | 0 | `00000000` | nichts läuft |
+| Standby, nur Wasserpumpe | 1 | `00000001` | Bit 0 |
+| Heat-Modus, Kompressor idle | 49 | `00110001` | Bits 0,4,5 |
+| Heat-Modus, aktiv heizend | 59 | `00111011` | Bits 0,1,3,4,5 |
+
+Praktische Regeln:
+- `reg39 & 0x01` → Wasserpumpe läuft
+- `(reg39 >> 1) & 0x01` → Kompressor heizt aktiv (= „nicht in Standby")
+
+### Vermutete Register (noch nicht eindeutig zugeordnet)
+| Modbus-Adr | Vermutung | Begründung aus Scans |
+|---|---|---|
+| 15 | Umgebungstemperatur (DP26, around_temp) | konstant 91 → 9,1 °C über alle Scans, passt zu Außentemp |
+| 17 | weiterer Umgebungssensor | konstant 92 → 9,2 °C |
+| 19 | Abgastemperatur (DP24, venting_temp) | konstant 662 → 66,2 °C |
+| 41 | Soll-Frequenz/Kompressor-Leistung | 0=Aus, 67=Eco-modulation, ~8270=Standby idle, 16451=volle Heizleistung |
+| 48 | Kompressor-Ist-Frequenz/-Last | 0 wenn nicht aktiv, 13–21 bei aktiver Heizung |
+| 64 | Lüfter-Drehzahl/Sensor | variiert mit Last (100=Eco/Aus, 230–350=aktiv) |
+| 75 | Kompressor-Verbrauch o.ä. | 0 in Standby, 5–15 nur in aktiv heizenden Zuständen |
+
+### Noch zu verifizieren (Live-Scan)
+- Bit 3 und Bits 4/5 von Reg 39 einzeln zuordnen (Modus-Wechsel beobachten).
+- Reg 41-Skalierung: ist das die Kompressor-Soll-Hz oder ein internes RPM-Maß?
+- Reg 52, 53, 54, 55, 72, 74 als Sensoren zuordnen (DP23/25 coiler/effluent_temp Kandidaten).
+- Magic-Value `32765` (0x7FFD) = Sensor nicht angeschlossen / Wert ungültig → ignorieren.
+- `-1012` / `0xFC0C` (= 64524 unsigned, Reg 89) = Sensor offen / nicht belegt.
+- Silent-Mode Scan, um Reg 132 = 0 zu bestätigen.
+
+## Vollständige Tuya-DP-Liste (OEM-Referenzdesign „海外泳池机公版")
+
+Quelle: GitHub make-all/tuya-local Issue #1712 (AquaForte Full Inverter Pool Heat Pump, product_id k5vqutj2llzox1gg).
+
+| DP | Code | Bedeutung | Typ | Details |
+|---|---|---|---|---|
+| 1 | switch | Ein/Aus | bool | true/false |
+| 2 | mode | Betriebsmodus (Inverter) | enum | Auto, Heating_Powerful, Cooling_Powerful, Heating_Smart, Cooling_Smart, Heating_Silent, Cooling_Silent |
+| 5 | work_mode | Betriebsmodus (Festfrequenz) | enum | Cool_mode, Heat_mode, Auto_mode |
+| 6 | temp_unit_convert | Temperatureinheit | enum | c, f |
+| 15 | fault | Störungsmeldung | bitmap | EE, E01–E29 |
+| 16 | temp_current | Aktuelle Temperatur | value | °C |
+| 17 | work_state | Arbeitsstatus | enum | Running, Defrosting, Standby, Fault |
+| 23 | coiler_temp | Heizregister-Temperatur | value | °C |
+| 24 | venting_temp | Abgastemperatur | value | °C |
+| 25 | effluent_temp | Auslaufwassertemperatur | value | °C |
+| 26 | around_temp | Umgebungstemperatur | value | °C |
+| 35 | temp_current_f | Aktuelle Temperatur | value | °F |
+| 38 | around_temp_f | Umgebungstemperatur | value | °F |
+| 39 | venting_temp_f | Abgastemperatur | value | °F |
+| 40 | effluent_temp_f | Auslaufwassertemperatur | value | °F |
+| 41 | coiler_temp_f | Heizregister-Temperatur | value | °F |
+| 101 | set_heating_temp | Solltemperatur Heizen | value | min 50, max 550, °C (÷10) |
+| 102 | set_cold_temp | Solltemperatur Kühlen | value | min 50, max 350, °C (÷10) |
+| 103 | new_fault_01 | Fehlercodetabelle 1 | bitmap | E01–E30 |
+| 104 | set_auto_temp | Solltemperatur Auto | value | min 50, max 400, °C (÷10) |
+| 105 | set_heating_temp_f | Solltemperatur Heizen | value | °F |
+| 106 | set_cold_temp_f | Solltemperatur Kühlen | value | °F |
+| 107 | new_fault_02 | Fehlercodetabelle 2 | bitmap | E31–E43 |
+| 108 | set_auto_temp_f | Solltemperatur Auto | value | °F |
+| 109 | unit_type | Gerätetyp | value | 0/1 |
+| 110 | new_driver_fault_01 | Treiberfehler-Tabelle 1 | bitmap | F01–F30 |
+| 111 | new_driver_fault_02 | Treiberfehler-Tabelle 2 | bitmap | F31–F48 |
+| 117 | frequency | Frequenzmodus | enum | Silent, Smart, Powerful |
+| 118 | fault_2 | Störungsmeldung 2 | bitmap | E30–E59 |
+| 119 | fault_3 | Störungsmeldung 3 | bitmap | E60–E88, display |
+| 120 | driver_fault_1 | Treiberfehler | bitmap | D17–D46 |
+| 121 | return_temp | Rückgastemperatur | value | °C |
+| 122 | return_temp_f | Rückgastemperatur | value | °F |
+| 123 | cool_coiler_temp | Kühlregister-Temperatur | value | °C |
+| 124 | cool_coiler_temp_f | Kühlregister-Temperatur | value | °F |
+| 125 | opening | EEV-Öffnung (Expansionsventil) | value | 0–1000, Einheit P |
+
+Achtung: `_f`-Setpoints (DP105/106/108) sind in der Cloud-Definition Fahrenheit. Im Modbus-Spiegel dieser Pumpe scheinen 106/107/109 die °C-Sollwerte mit +5-Offset zu DP101/102/104 zu sein → beim Live-Scan verifizieren.
+
+## Offene TODOs
+
+- [ ] WBR3 EN→GND-Brücke setzen, Master-Konflikt beseitigen.
+- [x] ~~Live-Scan Register 100–130 bei laufender Pumpe~~ → ersetzt durch 7 vollständige State-Scans 1–250 in `resources/modbus-scans/csv/`. Setpoints (Reg 105), Modus (Reg 93), Sub-Modus (Reg 132) bestätigt.
+- [ ] Sensor-DP-Offset (16, 23–26) verifizieren — Kandidaten: Reg 15/17/19 für ambient/venting, Reg 52–55 für coiler/effluent.
+- [ ] Reg 39 Bitmap durchprobieren (Modus auf Cool stellen, Standby/aktiv jeweils scannen → welche Bits ändern sich?).
+- [x] Silent-Mode Scan, um Reg 133 = 0 zu bestätigen.
+- [ ] Arduino-Code: Register-Konstanten + Skalierungs-/Enum-Dekodierung sauber strukturieren (Reg 39 als Bitmap, Reg 50÷10, Reg 105 in ganzen °C).
+
+## Vorhandene Dateien im Projekt
+- `resources/modbus-scans/*.png` — Screenshots der ModScan-Aufnahmen (7 States × 2 Hälften: Reg 1–125 und 126–250).
+- `resources/modbus-scans/csv/*.csv` — kombinierte CSVs pro Zustand (Register 1–250):
+  - `Status-Aus.csv` — Pumpe komplett aus
+  - `Standby-Ohne-Wasserpumpe.csv` — Standby, Wasserpumpe aus
+  - `Standby-Mit-Wasserpumpe.csv` — Standby, nur Wasserpumpe läuft
+  - `Standby.csv` — Heat-Modus, Kompressor in Modulationspause
+  - `Eco-Heat.csv` — Heat-Modus, Eco-/Smart-Frequenz
+  - `Boost-Heat.csv` — Heat-Modus, Boost-/Powerful-Frequenz
+  - `Wieder-Heizen.csv` — Standby → Heat (Sollwert hochgesetzt), Kompressor aktiv
+- Arduino-Sketch (selbst geschrieben) unter `src/`.

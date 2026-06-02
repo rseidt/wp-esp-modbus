@@ -39,20 +39,30 @@ typedef struct
 	optional_param_t optional_param;
 } modbus_register_t;
 
-const modbus_register_t registers[] = {
-	{93, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "ein_aus"},
-	{94, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "modus"},
-	{51, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_akt"},
-	{107, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_soll_kuehl"},
-	{106, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_soll_heiz"},
-	{109, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_soll_auto"}
-	/*{ 474, MODBUS_TYPE_HOLDING, REGISTER_TYPE_BITFIELD, "bits_primary_status", { .bitfield = {
-			"io_burner_1",
-			"io_burner_2",
-			"io_valve_isolation_open",
-			"io_valve_isolation_closed",
-			"io_pump_boiler"
-	} } },*/
+const modbus_register_t registers[] = { //register IDs are zero-based, i.e. register 40001 has id 0
+	{92, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "ein_aus"},
+	{93, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "modus"},
+	{132, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "sub_modus"},
+	{50, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_akt"},
+	{106, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_soll_kuehl"},
+	{105, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_soll_heiz"},
+	{108, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_soll_auto"},
+	{39, MODBUS_TYPE_HOLDING, REGISTER_TYPE_BITFIELD, "status_bits", {.bitfield = {
+		"wasserpumpe",       // Bit 0: bestätigt
+		"kompressor_aktiv",  // Bit 1: bestätigt (Standby vs. Heizen)
+		"status_bit2",       // Bit 2: unbekannt
+		"status_bit3",       // Bit 3: vermutet 4-Wege-/Magnetventil
+		"status_bit4",       // Bit 4: vermutet Heizmodus aktiv
+		"status_bit5"        // Bit 5: vermutet Heizmodus aktiv
+	}}},
+	// Vermutete Sensor-/Status-Register — zur weiteren Identifikation über MQTT loggen
+	{15, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_umgebung_v"},
+	{17, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_sensor2_v"},
+	{19, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_abgas_v"},
+	{41, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "frequenz_soll_v"},
+	{48, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "kompressor_ist_v"},
+	{64, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "luefter_v"},
+	{75, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "kompressor_last_v"},
 };
 
 #endif // SRC_MODBUS_REGISTERS_H_

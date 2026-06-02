@@ -24,8 +24,11 @@ bool mqttConnected = false;
 
 int freeHeap;
 
+// Timer<1, millis> hat nur 1 Slot — defensives cancel() vor every(), damit ein bereits laufender
+// Task nicht den neuen .every()-Aufruf still verschluckt.
 void startModbusPoller()
 {
+	modbus_poller_timer.cancel();
 	modbus_poller_timer.every(100, runModbusPollerTask);
 }
 
@@ -37,6 +40,7 @@ void stopModbusPoller()
 
 void startWifiConnectTimer()
 {
+	wifi_reconnect_timer.cancel();
 	wifi_reconnect_timer.every(2000, connectToWifi);
 }
 
@@ -47,6 +51,7 @@ void stopWifiConnectTimer()
 
 void startMemoryReportTimer()
 {
+	memory_report_timer.cancel();
 	memory_report_timer.every(20000, reportMemoryStatus);
 }
 void stopMemoryReportTimer()
@@ -56,6 +61,7 @@ void stopMemoryReportTimer()
 
 void startMqttConnectTimer()
 {
+	mqtt_reconnect_timer.cancel();
 	mqtt_reconnect_timer.every(2000, connectToMqtt);
 }
 
@@ -137,10 +143,29 @@ void onMqttConnect(bool sessionPresent)
 void onMqttDisconnect(AsyncMqttClientDisconnectReason reason)
 {
 	log(LOG_LEVEL_WARNING, "Disconnected from MQTT: " + String((int)reason));
+	// Timer immer starten — connect() failt solange WLAN weg ist, retried aber alle 2 s automatisch.
+	// Zusätzlich triggert der WiFi-Event-Handler den Connect bei STA_GOT_IP.
+	startMqttConnectTimer();
+}
 
-	if (WiFi.isConnected())
+// Reagiert auf WLAN-Statusänderungen. Nötig weil:
+//  - Webserver (synchrone WebServer-Klasse) verliert seinen TCP-Listen-Socket beim WLAN-Teardown
+//    und hat keinen eigenen Reconnect-Hook → muss bei GOT_IP neu gebunden werden.
+//  - MQTT-Reconnect ist über den Timer abgedeckt, hier wird er zur Sicherheit angestoßen.
+void wiFiEvent(WiFiEvent_t event)
+{
+	switch (event)
 	{
+	case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+		log(LOG_LEVEL_WARNING, "WiFi disconnected");
+		break;
+	case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+		log(LOG_LEVEL_INFO, "WiFi got IP: " + WiFi.localIP().toString());
+		restartWebserver();
 		startMqttConnectTimer();
+		break;
+	default:
+		break;
 	}
 }
 
@@ -227,6 +252,13 @@ bool runModbusPollerTask(void *pvParameters)
 		log(LOG_LEVEL_INFO, "Pausing Modbus poller for " + String(MODBUS_SCANRATE) + " seconds to allow other Modbus masters to communicate.");
 		stopModbusPoller();
 	}
+	String modbus_state = getModbusState();
+		if (modbus_state != "" && mqtt_client.connected())
+		{
+			String mqtt_complete_topic = param_mqtt_topic;
+			mqtt_complete_topic += "/" + String(HOSTNAME) + "/modbus_status";
+			mqtt_client.publish(mqtt_complete_topic.c_str(), 0, true, modbus_state.c_str(), modbus_state.length());
+		}
 	modbus_poller_inprogress = false;
 
 #endif // MODBUS_DISABLED
@@ -257,7 +289,7 @@ void setup()
 	log(LOG_LEVEL_INFO, "Firmware version " + String(FIRMWARE_VERSION) + " (compiled at " + __DATE__ + " " + __TIME__ + ")");
 	log(LOG_LEVEL_INFO, "Hostname: " + String(HOSTNAME));
 
-	//WiFi.onEvent(wiFiEvent);
+	WiFi.onEvent(wiFiEvent);
 
 	mqtt_client.onConnect(onMqttConnect);
 	mqtt_client.onDisconnect(onMqttDisconnect);

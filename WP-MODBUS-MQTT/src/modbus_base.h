@@ -24,8 +24,13 @@
 #define RTS NOT_A_PIN
 
 #define MODBUS_BAUDRATE 9600
+#define MODBUS_TIMEOUT 1000
 #define MODBUS_UNIT 1
 #define MODBUS_RETRIES 2
+// Bei Buskollisionen mit dem Tuya-Master (Invalid Slave ID / Invalid CRC / Timeout)
+// deutlich mehr Versuche, bis ein Fenster ohne Tuya-Verkehr erwischt wird.
+// Sinnvoll nur solange WBR3 noch aktiv ist; nach WBR3-Stilllegung kann auf MODBUS_RETRIES zurückgesetzt werden.
+#define MODBUS_RETRIES_BUS_COLLISION 30
 
 
 void preTransmission();
@@ -34,4 +39,5 @@ void initModbus();
 bool writeModbusRegister(const char *register_name, uint16_t value);
 bool fillRegisterValues();
 void writeRegisterValuesToJson(ArduinoJson::JsonVariant variant);
+String getModbusState();
 #endif // SRC_MODBUS_BASE_H_

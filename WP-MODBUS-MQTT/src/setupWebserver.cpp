@@ -103,3 +103,12 @@ void setupWebserver()
 	server.begin();
 	log(LOG_LEVEL_INFO, "Webserver started on port 80");
 }
+
+// Bindet den TCP-Listen-Socket neu. Nötig nach WLAN-Verlust: lwIP reißt das Interface ab,
+// der vorhandene Socket wird ungültig, server.handleClient() läuft ins Leere.
+void restartWebserver()
+{
+	server.close();
+	server.begin();
+	log(LOG_LEVEL_INFO, "Webserver re-bound on port 80");
+}

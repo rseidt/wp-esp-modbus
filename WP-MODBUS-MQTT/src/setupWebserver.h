@@ -12,5 +12,6 @@
 
 void loopWebserver();
 void setupWebserver();
+void restartWebserver();
 
 #endif // SETUPWEBSERVER_H

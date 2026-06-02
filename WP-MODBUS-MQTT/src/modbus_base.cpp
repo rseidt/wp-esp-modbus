@@ -8,7 +8,20 @@ int num_registers = sizeof(registers) / sizeof(modbus_register_t);
 int currentRegisterIndex = 0;
 int currentTryIndex = 0;
 
+String *modbusResultMsg;
+uint8_t lastModbusResult = ModbusMaster::ku8MBSuccess;
+
 bool modbus_poller_task_running = false;
+
+// True für Fehler, die durch Buskollisionen mit dem Tuya-Master entstehen (verstümmelte/fremde Frames).
+// Diese werden weggeworfen und sofort erneut versucht — der Slave selbst hat das Frame nie gesehen.
+bool isTransientModbusError(uint8_t result)
+{
+	return result == ModbusMaster::ku8MBInvalidSlaveID
+		|| result == ModbusMaster::ku8MBInvalidCRC
+		|| result == ModbusMaster::ku8MBResponseTimedOut
+		|| result == ModbusMaster::ku8MBInvalidFunction;
+}
 
 // The ESP32 has 3 hardware serial ports, the ESP8266 has only 1 which we use for debugging.
 // So we do the modbus communication over Software Serial.
@@ -17,42 +30,59 @@ HardwareSerial modbusSerial(2); // Use UART2
 #else
 SoftwareSerial modbusSerial(RXD, TXD); // RX, TX
 #endif
+
+#if MODBUS_BAUDRATE > 19200
+    uint32_t t3_5 = 1750;
+#else
+    uint32_t t3_5 = (1000000 * 39) / MODBUS_BAUDRATE + 500; // +500us : to be safe
+#endif
+
+
+
 void preTransmission()
 {
-	digitalWrite(RTS, 1);
+	if (RTS != NOT_A_PIN)
+	{
+		digitalWrite(RTS, 1);
+	}
 }
 
 void postTransmission()
 {
-	digitalWrite(RTS, 0);
+	if (RTS != NOT_A_PIN)
+	{
+		digitalWrite(RTS, 0);
+	}
 }
 
 void initModbus()
 {
 
 	register_values = new uint16_t[num_registers];
-	modbusSerial.begin(9600); // Using ESP32 UART2 for Modbus
+	modbusSerial.begin(MODBUS_BAUDRATE); // Using ESP32 UART2 for Modbus
+	#ifdef ARDUINO_ARCH_ESP32
+	modbusSerial.setPins(RXD, TXD);
+	#endif
 	modbus_client.begin(MODBUS_UNIT, modbusSerial);
-
 	// do we have a flow control pin?
 	if (RTS != NOT_A_PIN)
 	{
 		// Init in receive mode
 		pinMode(RTS, OUTPUT);
 		digitalWrite(RTS, 0);
-
-		// Callbacks allow us to configure the RS485 transceiver correctly
-		modbus_client.preTransmission(preTransmission);
-		modbus_client.postTransmission(postTransmission);
 	}
+	modbus_client.preTransmission(preTransmission);
+	modbus_client.postTransmission(postTransmission);
 }
 
 bool getModbusResultMsg(ModbusMaster *node, uint8_t result)
 {
+	lastModbusResult = result;
 	String tmpstr2 = "";
 	switch (result)
 	{
 	case node->ku8MBSuccess:
+		modbusResultMsg = new String(tmpstr2);
 		return true;
 		break;
 	case node->ku8MBIllegalFunction:
@@ -84,12 +114,26 @@ bool getModbusResultMsg(ModbusMaster *node, uint8_t result)
 		break;
 	}
 	log(LOG_LEVEL_ERROR, tmpstr2);
+	modbusResultMsg = new String(tmpstr2);
 	return false;
+}
+
+String getModbusState()
+{
+	if (modbusResultMsg != nullptr)
+	{
+		return *modbusResultMsg;
+	}
+	else
+	{
+		return "";
+	}
 }
 
 bool writeModbusRegister(const char *register_name, uint16_t value)
 {
 	log(LOG_LEVEL_WARNING, "Writing data");
+	delayMicroseconds(t3_5); // inter-frame delay for Modbus RTU
 	uint16_t register_id = -1;
 	for (uint8_t i = 0; i < sizeof(registers) / sizeof(modbus_register_t); ++i)
 	{
@@ -103,25 +147,32 @@ bool writeModbusRegister(const char *register_name, uint16_t value)
 		log(LOG_LEVEL_ERROR, "Register name '" + String(register_name) + "' not found");
 		return true;
 	}
-	for (uint8_t i = 1; i <= MODBUS_RETRIES + 1; ++i)
+	// Write tolerieren Buskollisionen: bei transienten Fehlern bis MODBUS_RETRIES_BUS_COLLISION+1 Versuche.
+	// Echte Slave-Fehler werden weiterhin nach MODBUS_RETRIES+1 Versuchen aufgegeben.
+	uint16_t max_attempts = MODBUS_RETRIES_BUS_COLLISION + 1;
+	for (uint16_t i = 1; i <= max_attempts; ++i)
 	{
-		log(LOG_LEVEL_INFO, "Trial " + String(i) + "/" + String(MODBUS_RETRIES + 1));
-		uint8_t result;
-		result = modbus_client.writeSingleRegister(register_id, value);
+		log(LOG_LEVEL_INFO, "Trial " + String(i) + "/" + String(max_attempts));
+		uint8_t result = modbus_client.writeSingleRegister(register_id, value);
 		if (getModbusResultMsg(&modbus_client, result))
 		{
 			log(LOG_LEVEL_WARNING, "Data written: " + String(value) + ", Register ID: " + String(register_id));
 			return true;
 		}
+		if (!isTransientModbusError(result) && i > MODBUS_RETRIES)
+		{
+			log(LOG_LEVEL_ERROR, "Permanent Modbus error (0x" + String(result, HEX) + "), giving up.");
+			return false;
+		}
 	}
-	// Time-out
-	log(LOG_LEVEL_ERROR, "Time out");
+	log(LOG_LEVEL_ERROR, "Time out after " + String(max_attempts) + " attempts");
 	return false;
 }
 
 bool getModbusValue(uint16_t register_id, modbus_entity_t modbus_entity, uint16_t *value_ptr)
 {
 	log(LOG_LEVEL_INFO, "Requesting data");
+	delayMicroseconds(t3_5); // inter-frame delay for Modbus RTU
 	switch (modbus_entity)
 	{
 	case MODBUS_TYPE_HOLDING:
@@ -145,7 +196,7 @@ bool getModbusValue(uint16_t register_id, modbus_entity_t modbus_entity, uint16_
 bool fillRegisterValues()
 {
 	uint16_t raw_value;
-	log(LOG_LEVEL_INFO, "Filling register " + String(registers[currentRegisterIndex].name) + " (index " + String(currentRegisterIndex) + "/" + String(num_registers - 1) + "); quantity of tries: " + String(currentTryIndex + 1) + "/" + String(MODBUS_RETRIES + 1));
+	log(LOG_LEVEL_INFO, "Filling register " + String(registers[currentRegisterIndex].name) + " (index " + String(currentRegisterIndex) + "/" + String(num_registers - 1) + "); try " + String(currentTryIndex + 1));
 	if (getModbusValue(registers[currentRegisterIndex].id, registers[currentRegisterIndex].modbus_entity, &raw_value))
 	{
 		register_values[currentRegisterIndex] = raw_value;
@@ -155,8 +206,11 @@ bool fillRegisterValues()
 	}
 	else
 	{
-		log(LOG_LEVEL_ERROR, "Failed to read register " + String(registers[currentRegisterIndex].name));
-		if (currentTryIndex < MODBUS_RETRIES)
+		// Retry-Budget abhängig vom Fehlertyp: bei Buskollision (Tuya-Master stört) viel mehr Versuche,
+		// bei echten Slave-Fehlern (Illegal Function/Address/Value, Slave Device Failure) schnell aufgeben.
+		int retry_budget = isTransientModbusError(lastModbusResult) ? MODBUS_RETRIES_BUS_COLLISION : MODBUS_RETRIES;
+		log(LOG_LEVEL_WARNING, "Failed to read register " + String(registers[currentRegisterIndex].name) + " (try " + String(currentTryIndex + 1) + "/" + String(retry_budget + 1) + ", result=0x" + String(lastModbusResult, HEX) + ")");
+		if (currentTryIndex < retry_budget)
 		{
 			currentTryIndex++;
 		}
