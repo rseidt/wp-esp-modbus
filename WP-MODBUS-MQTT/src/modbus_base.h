@@ -32,6 +32,10 @@
 // Sinnvoll nur solange WBR3 noch aktiv ist; nach WBR3-Stilllegung kann auf MODBUS_RETRIES zurückgesetzt werden.
 #define MODBUS_RETRIES_BUS_COLLISION 30
 
+// Block-Read fuer den Webserver-Registerdump.
+#define MODBUS_DUMP_CHUNK 50   // Register pro Block-Transaktion (<= ku8MaxBufferSize = 64)
+#define MODBUS_DUMP_RETRIES 2  // Wiederholungen pro Chunk nur bei transientem (Kollisions-)Fehler
+
 
 void preTransmission();
 void postTransmission();
@@ -40,4 +44,6 @@ bool writeModbusRegister(const char *register_name, uint16_t value);
 bool fillRegisterValues();
 void writeRegisterValuesToJson(ArduinoJson::JsonVariant variant);
 String getModbusState();
+bool readHoldingRange(uint16_t start_id, uint16_t count, uint16_t *values, bool *valid);
+void writeFaultStatusToJson(ArduinoJson::JsonVariant variant);
 #endif // SRC_MODBUS_BASE_H_

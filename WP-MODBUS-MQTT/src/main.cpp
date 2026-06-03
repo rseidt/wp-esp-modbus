@@ -234,6 +234,7 @@ bool runModbusPollerTask(void *pvParameters)
 	{						   // returns true if completed
 		JsonDocument json_doc; // instanciate JSON storage
 		writeRegisterValuesToJson(json_doc);
+		writeFaultStatusToJson(json_doc); // Geraetefehler als faults[]/fault_active in dieselbe Struktur
 		size_t json_size = measureJson(json_doc) + 1;
 		log(LOG_LEVEL_INFO, "JSON size: " + String(json_size) + " bytes");
 		char *buffer = (char *)malloc(json_size * sizeof(char));

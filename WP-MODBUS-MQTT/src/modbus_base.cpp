@@ -1,4 +1,5 @@
 #include "modbus_base.h"
+#include "modbus_faults.h"
 
 // instantiate ModbusMaster object
 ModbusMaster modbus_client;
@@ -191,6 +192,111 @@ bool getModbusValue(uint16_t register_id, modbus_entity_t modbus_entity, uint16_
 	}
 	value_ptr = nullptr;
 	return false;
+}
+
+// Liest die Holding-Register [start_id .. start_id+count-1] block-weise in values[] und
+// vermerkt pro Register in valid[], ob der Wert gueltig ist. Gedacht fuer den Webserver-Dump.
+// Block-Reads (bis MODBUS_DUMP_CHUNK Register je Transaktion) statt Einzel-Reads → weniger
+// Kollisionsfenster mit dem Tuya-Master und beschraenkte Worst-Case-Dauer.
+// Rueckgabe: true, wenn alle Chunks erfolgreich gelesen wurden.
+bool readHoldingRange(uint16_t start_id, uint16_t count, uint16_t *values, bool *valid)
+{
+	bool all_ok = true;
+	uint16_t done = 0;
+	while (done < count)
+	{
+		uint16_t chunk = count - done;
+		if (chunk > MODBUS_DUMP_CHUNK)
+		{
+			chunk = MODBUS_DUMP_CHUNK;
+		}
+		bool chunk_ok = false;
+		for (uint8_t attempt = 0; attempt <= MODBUS_DUMP_RETRIES && !chunk_ok; ++attempt)
+		{
+			delayMicroseconds(t3_5); // inter-frame delay for Modbus RTU
+			uint8_t result = modbus_client.readHoldingRegisters(start_id + done, chunk);
+			if (getModbusResultMsg(&modbus_client, result))
+			{
+				for (uint16_t i = 0; i < chunk; ++i)
+				{
+					values[done + i] = modbus_client.getResponseBuffer(i);
+					valid[done + i] = true;
+				}
+				chunk_ok = true;
+			}
+			else if (!isTransientModbusError(result))
+			{
+				// Permanenter Fehler (z.B. Illegal Data Address im Block) → Retries sinnlos.
+				break;
+			}
+		}
+		if (!chunk_ok)
+		{
+			log(LOG_LEVEL_WARNING, "Dump chunk starting at " + String(start_id + done) + " failed (result=0x" + String(lastModbusResult, HEX) + ")");
+			for (uint16_t i = 0; i < chunk; ++i)
+			{
+				valid[done + i] = false;
+			}
+			all_ok = false;
+		}
+		done += chunk;
+		yield(); // TCP/MQTT-Stacks bedienen und Watchdog fuettern
+	}
+	return all_ok;
+}
+
+// Liest die bekannten Fault-Register und haengt die AKTIVEN Geraetefehler an das
+// uebergebene JSON (dasselbe Dokument wie die Registerwerte -> Topic .../data):
+//   "fault_active": bool, "faults": ["flow_fault", "E03", ...]
+// Nur gesetzte Bits werden aufgenommen (kein Dauer-Null-Ballast). Solange alle Adressen
+// in modbus_faults.h auf FAULT_ADDR_TODO stehen, bleibt "faults" leer und es findet kein
+// Bus-Zugriff statt. Sobald echte Adressen eingetragen sind, erscheinen gesetzte Bits
+// automatisch als Code-Liste (semantisch z.B. "flow_fault", numerisch z.B. "E03").
+void writeFaultStatusToJson(ArduinoJson::JsonVariant variant)
+{
+	JsonArray active = variant["faults"].to<JsonArray>();
+	bool any = false;
+
+	int num_fault_regs = sizeof(faultRegisters) / sizeof(fault_register_t);
+	for (int i = 0; i < num_fault_regs; ++i)
+	{
+		const fault_register_t &fr = faultRegisters[i];
+		if (fr.modbus_addr == FAULT_ADDR_TODO)
+		{
+			continue; // Adresse noch nicht identifiziert -> ueberspringen (kein Bus-Zugriff)
+		}
+
+		uint16_t val;
+		if (!getModbusValue(fr.modbus_addr, MODBUS_TYPE_HOLDING, &val))
+		{
+			continue; // Lesefehler (z.B. Buskollision) -> diesen Zyklus auslassen
+		}
+		if (val == 0)
+		{
+			continue; // keine Fehlerbits gesetzt
+		}
+
+		for (uint8_t b = 0; b < fr.bit_count && b < 16; ++b)
+		{
+			if (!((val >> b) & 1))
+			{
+				continue;
+			}
+			if (fr.labels[b] != nullptr)
+			{
+				active.add(fr.labels[b]); // statisches Literal -> ArduinoJson speichert Zeiger
+			}
+			else if (fr.code_prefix != 0)
+			{
+				char buf[8];
+				snprintf(buf, sizeof(buf), "%c%02u", fr.code_prefix, fr.first_code + b);
+				active.add(String(buf)); // String erzwingt Kopie des fluechtigen Puffers
+			}
+			any = true;
+		}
+	}
+
+	variant["fault_active"] = any;
 }
 
 bool fillRegisterValues()

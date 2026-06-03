@@ -44,7 +44,9 @@ Die Modbus-Holding-Register sind eine **Spiegelung der Tuya-Datapoint-(DP-)IDs**
 | Modbus-Adr | Funktion | Tuya-DP | Skalierung/Werte |
 |---|---|---|---|
 | 39 | Status-Bitmap | – (zusammengesetzt) | Bit 0 = Wasserpumpe, Bit 1 = Kompressor läuft („Running" vs. „Standby"), Bit 3 = 4-Wege-Ventil/Magnetventil (vermutet), Bits 4+5 = Heizmodus aktiv. Typische Werte: 0=Aus, 1=nur Wasserpumpe, 49=Heat-Modus idle/Standby, 59=Heat-Modus aktiv heizend |
-| 47 | Wassertemperatur (Spiegel von Reg 51) | (DP16-Spiegel) | ÷10 °C, identisch zu Reg 51 in allen Scans |
+| 26 | Fehlertabelle new_fault_01 LOW (E01–E16) | DP103-Spiegel (lo) | Bitmap, Bit N = E(N+1). Im Dump-Diff = 0 (kein E01–E16 aktiv) |
+| 27 | Fehlertabelle new_fault_01 HIGH (E17–E30) | DP103-Spiegel (hi) | Bitmap, Bit N = E(N+17). **Bestätigt:** Flow-Fehler → 1 (Bit 0 = E17, deckt sich mit Display) |
+| 47 | Wassertemperatur (Spiegel von Reg 50) | (DP16-Spiegel) | ÷10 °C, ≈ Reg 50 (Dump: 208 vs. 210). Spiegelt Reg 50, nicht Reg 51 |
 | 50 | Wassertemperatur aktuell | DP16 (temp_current) | ÷10 °C (212 → 21,2 °C). Bestätigt via Kreuzvergleich (Aus: 21,5 °C kalt, Heizbetrieb: 22,8–25,2 °C) |
 | 92 | Ein/Aus | DP1 (switch) | bool 0/1 |
 | 93 | Modus | DP2 (mode) | 2=Heat, 0=Auto, 1=Cool (in allen Scans 2, da nur Heizbetrieb getestet) |
@@ -68,18 +70,44 @@ Praktische Regeln:
 ### Vermutete Register (noch nicht eindeutig zugeordnet)
 | Modbus-Adr | Vermutung | Begründung aus Scans |
 |---|---|---|
-| 15 | Umgebungstemperatur (DP26, around_temp) | konstant 91 → 9,1 °C über alle Scans, passt zu Außentemp |
-| 17 | weiterer Umgebungssensor | konstant 92 → 9,2 °C |
-| 19 | Abgastemperatur (DP24, venting_temp) | konstant 662 → 66,2 °C |
 | 41 | Soll-Frequenz/Kompressor-Leistung | 0=Aus, 67=Eco-modulation, ~8270=Standby idle, 16451=volle Heizleistung |
 | 48 | Kompressor-Ist-Frequenz/-Last | 0 wenn nicht aktiv, 13–21 bei aktiver Heizung |
 | 64 | Lüfter-Drehzahl/Sensor | variiert mit Last (100=Eco/Aus, 230–350=aktiv) |
 | 75 | Kompressor-Verbrauch o.ä. | 0 in Standby, 5–15 nur in aktiv heizenden Zuständen |
 
+### Widerlegte Zuordnungen (aus Datenmodell entfernt)
+| Modbus-Adr | Frühere Vermutung | Warum widerlegt |
+|---|---|---|
+| 15 | Umgebungstemperatur (DP26) | lieferte ~9,1 °C, reale Umgebungstemperatur lag aber > 20 °C → passt nicht |
+| 17 | weiterer Umgebungssensor | ~9,2 °C, dito |
+| 19 | Abgastemperatur (DP24, venting_temp) | ~66,2 °C, aber im Dauer-Heizbetrieb eher unter Umgebungstemperatur erwartet → unplausibel |
+
+Umgebungstemperatur bleibt **UNIDENTIFIZIERT** (around_temp, DP26) — auch der Quervergleich mit den alten Scans liefert keinen Treffer (siehe unten). Echte Abgas-/Heißgastemperatur (venting_temp, DP24) taucht ebenfalls in keinem Scan als plausibler Wert auf → offen.
+
+### Temperatur-Block Reg 51–55 — Quervergleich alt vs. neu (Vollheiz-Zustand)
+Wichtig: alte Scans sind **1-basiert**, neue Dumps **0-basiert** → `old_reg = new_reg + 1`.
+Verglichen wurde der identische Betriebszustand (Status 59, Freq 16451 = Vollheizen),
+der in alt **Boost-Heat**/**Wieder-Heizen** und im neuen `clean`-Dump vorliegt. Damals
+~20 °C Außentemp, jetzt 14 °C → erwartete Differenz eines echten Umgebungssensors ≈ −6 °C (−60 roh).
+| Reg (neu) | Boost (alt) | clean (neu) | Δ | Deutung |
+|---|---|---|---|---|
+| 53 | 150 (15,0) | 91 (9,1) | **−59** | trackt die −6 °C exakt, liegt aber im Heizbetrieb ~5 °C UNTER Umgebung → **Verdampfer/Spule** (coiler_temp), nicht Umgebung |
+| 51 | 139 (13,9) | 98 (9,8) | −41 | dito, zweite Spulen-/Verdampferseite |
+| 52 | warm | 223 (22,3) | – | wasser-/kondensatorseitig |
+| 54 | 190 (19,0) | 203 (20,3) | +7 | liest ~20 °C in BEIDEN Sessions → nicht umgebungsgetrieben |
+| 55 | 170 (17,0) | 140 (14,0) | −25 | trackt Umgebung nur schwach (−2,5 statt −6 °C); las 16–17 °C bei real 20 °C → unklar |
+
+Befund: Kein Register liest echte Umgebungsluft (~20 alt / ~14 neu). Die einzigen zustands-
+**unabhängigen** Temp-Register (neu 18 = const 173, neu 72 = const ~230) sind in BEIDEN
+Sessions konstant, fielen also NICHT von 20→14 °C → ebenfalls nicht Umgebung. around_temp
+ist mit den vorhandenen Daten nicht auffindbar; ggf. liefert die Pumpe DP26 gar nicht über Modbus.
+Reg 51/53 als coiler-Kandidaten, 52/54 als Wasser/Gas — final per Kühlbetrieb-Diff zuordnen.
+
 ### Noch zu verifizieren (Live-Scan)
 - Bit 3 und Bits 4/5 von Reg 39 einzeln zuordnen (Modus-Wechsel beobachten).
 - Reg 41-Skalierung: ist das die Kompressor-Soll-Hz oder ein internes RPM-Maß?
-- Reg 52, 53, 54, 55, 72, 74 als Sensoren zuordnen (DP23/25 coiler/effluent_temp Kandidaten).
+- Reg 51–54, 72, 74 final als coiler/effluent/return zuordnen (Reg 55 = Umgebung bestätigt; siehe Temperatur-Block oben).
+- Fehlertabellen jenseits new_fault_01 (Reg 26/27): Adressen von new_fault_02, fault_2/3 und Treiberfehler (F-/D-Codes) per Diff suchen; im modbus_faults.h stehen sie noch auf FAULT_ADDR_TODO.
 - Magic-Value `32765` (0x7FFD) = Sensor nicht angeschlossen / Wert ungültig → ignorieren.
 - `-1012` / `0xFC0C` (= 64524 unsigned, Reg 89) = Sensor offen / nicht belegt.
 - Silent-Mode Scan, um Reg 132 = 0 zu bestätigen.
@@ -133,7 +161,10 @@ Achtung: `_f`-Setpoints (DP105/106/108) sind in der Cloud-Definition Fahrenheit.
 
 - [ ] WBR3 EN→GND-Brücke setzen, Master-Konflikt beseitigen.
 - [x] ~~Live-Scan Register 100–130 bei laufender Pumpe~~ → ersetzt durch 7 vollständige State-Scans 1–250 in `resources/modbus-scans/csv/`. Setpoints (Reg 105), Modus (Reg 93), Sub-Modus (Reg 132) bestätigt.
-- [ ] Sensor-DP-Offset (16, 23–26) verifizieren — Kandidaten: Reg 15/17/19 für ambient/venting, Reg 52–55 für coiler/effluent.
+- [x] Geräte-Fehlertabelle new_fault_01 lokalisiert: **Reg 26 (lo) / Reg 27 (hi)**, Flow-Fehler = E17 (Reg 27 Bit 0), per Display bestätigt. In `modbus_faults.h` eingetragen.
+- [ ] Umgebungstemperatur (around_temp, DP26) **weiterhin offen** — Quervergleich alt(20 °C)/neu(14 °C) ergab keinen Treffer; Reg 55 als Kandidat verworfen. Evtl. liefert die Pumpe DP26 nicht per Modbus. Reg 15/17 bleiben widerlegt.
+- [ ] Restliche Fehlertabellen (new_fault_02, fault_2/3, F-/D-Treiberfehler) und Abgastemp (venting_temp, DP24) per weiterer Diffs lokalisieren — stehen noch auf FAULT_ADDR_TODO bzw. offen.
+- [ ] Temperatur-Block Reg 51–55 final coiler/effluent/return zuordnen (Kandidaten als `temp_*_v` im Datenmodell, über MQTT mitloggen); Reg 51/53 = Verdampfer/Spule-Kandidaten.
 - [ ] Reg 39 Bitmap durchprobieren (Modus auf Cool stellen, Standby/aktiv jeweils scannen → welche Bits ändern sich?).
 - [x] Silent-Mode Scan, um Reg 133 = 0 zu bestätigen.
 - [ ] Arduino-Code: Register-Konstanten + Skalierungs-/Enum-Dekodierung sauber strukturieren (Reg 39 als Bitmap, Reg 50÷10, Reg 105 in ganzen °C).

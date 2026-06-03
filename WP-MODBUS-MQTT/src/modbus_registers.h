@@ -55,10 +55,23 @@ const modbus_register_t registers[] = { //register IDs are zero-based, i.e. regi
 		"status_bit4",       // Bit 4: vermutet Heizmodus aktiv
 		"status_bit5"        // Bit 5: vermutet Heizmodus aktiv
 	}}},
-	// Vermutete Sensor-/Status-Register — zur weiteren Identifikation über MQTT loggen
-	{15, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_umgebung_v"},
-	{17, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_sensor2_v"},
-	{19, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_abgas_v"},
+	// Temperatur-Block 51–55 (Rohwert ×10 wie temp_akt; ÷10 → °C) — alle noch Kandidaten (_v).
+	// Quervergleich mit den alten 1-basierten Scans (old reg = new+1) im selben Vollheiz-Zustand
+	// (Außentemp damals ~20 °C, jetzt 14 °C, also -6 °C / -60 roh):
+	//   Reg 53: 150→91 (-60) = trackt die Umgebungs-Differenz exakt, liegt aber im Heizbetrieb
+	//           ~5 °C UNTER Umgebung → Verdampfer-/Spulentemp (coiler_temp, DP23), NICHT Umgebung.
+	//   Reg 51: ähnliches Verhalten (kalt im Heizbetrieb) → zweite Spulen-/Verdampferseite.
+	//   Reg 52/54: warm (~20–27 °C), wasser-/kondensatorseitig.
+	//   Reg 55: 16–17 °C (alt) → 14 °C (neu); trackt die Umgebung NICHT sauber → unklar.
+	// FAZIT: KEIN Register liest echte Umgebungsluft (~20 alt / ~14 neu) → around_temp (DP26)
+	// bleibt UNIDENTIFIZIERT. Block trotzdem als Kandidaten loggen, um coiler/effluent/return
+	// per weiterer Diffs (Kühlbetrieb, andere Außentemp) endgültig zuzuordnen.
+	{51, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_spule_v"},
+	{53, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_spule2_v"},
+	{52, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_wasser_v"},
+	{54, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_wasser2_v"},
+	{55, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "temp_55_v"},
+	// Vermutete Status-/Last-Register — zur weiteren Identifikation über MQTT loggen.
 	{41, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "frequenz_soll_v"},
 	{48, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "kompressor_ist_v"},
 	{64, MODBUS_TYPE_HOLDING, REGISTER_TYPE_U16, "luefter_v"},
