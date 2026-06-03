@@ -56,6 +56,18 @@ void postTransmission()
 	}
 }
 
+// Idle-Callback der Modbus-Lib: wird waehrend des Wartens auf eine Antwort aufgerufen,
+// solange keine Bytes anliegen. Ohne diesen Callback busy-wartet readHoldingRegisters()
+// bis zu ku16MBResponseTimeout (2 s) OHNE yield -> bei mehreren Retams am Stueck (Block-Read
+// unter Tuya-Buskollision) summieren sich die Wartezeiten > 5 s -> Task-Watchdog-Reset.
+// delay(1) == vTaskDelay(1 Tick): laesst die niederpriore IDLE-Task laufen, die den
+// Task-Watchdog zuruecksetzt. Greift waehrend echter Datenstroeme nicht (dann ist
+// _serial->available() true), bremst die normale Kommunikation also nicht.
+static void modbusIdle()
+{
+	delay(1);
+}
+
 void initModbus()
 {
 
@@ -74,6 +86,7 @@ void initModbus()
 	}
 	modbus_client.preTransmission(preTransmission);
 	modbus_client.postTransmission(postTransmission);
+	modbus_client.idle(modbusIdle); // waehrend des Wartens an Scheduler abgeben (WDT-Schutz)
 }
 
 bool getModbusResultMsg(ModbusMaster *node, uint8_t result)
@@ -229,6 +242,7 @@ bool readHoldingRange(uint16_t start_id, uint16_t count, uint16_t *values, bool 
 				// Permanenter Fehler (z.B. Illegal Data Address im Block) → Retries sinnlos.
 				break;
 			}
+			yield(); // zwischen den Versuchen abgeben, damit kein langer Span ohne yield entsteht
 		}
 		if (!chunk_ok)
 		{
