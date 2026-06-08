@@ -23,6 +23,14 @@ Eine selbstgebaute ESP32-basierte Modbus-RTU/MQTT-Bridge, die eine günstige „
 - **Symptom:** ESP32 funktioniert einwandfrei, solange die Hersteller-App geschlossen ist. Sobald die App das Tuya-Modul aufweckt, kollidieren die Anfragen → ESP32 bekommt „Invalid Slave ID" (verstümmelte Antwortframes durch Buskollision).
 - **Praxisbefund (WBR3 stillgelegt):** Das Display selbst ist ein eigener Master und pollt weiter gelegentlich über A/B (nur das WiFi-Modul ist abgeschaltet, nicht die Display-MCU). Dadurch bleiben **seltene Restkollisionen** bestehen — viel weniger als bei aktiver App, aber nicht null. Im Betrieb unkritisch: die hohen Retries (`MODBUS_RETRIES_BUS_COLLISION`) fangen sie ab, die Dekodierung bleibt korrekt. Bewusst so belassen.
 
+### These (2026-06-09): Hauptursache des Dauer-Rauschens = fehlende gemeinsame Masse
+Wichtige Korrektur des Ursachenbilds. Symptom war **durchgehend** „Invalid Slave ID" und **gar keine** gültigen Reads (nicht nur seltene Restkollisionen), auch ohne dass der ESP selbst schrieb.
+
+- **Befund:** Der ESP wurde aus einer **separaten 5V-Quelle auf der Platine** gespeist, deren GND **keinen Durchgang** zur Busmasse (`12V-` am A/B/12V-Stecker) hatte (per Multimeter bestätigt). RS485 ist differentiell, braucht aber eine **gemeinsame Masse-Referenz** innerhalb des Common-Mode-Bereichs. Ohne sie driftet die Gleichtaktspannung weg → der Empfänger liest Müll → „Invalid Slave ID". Das ist **kein** Zweit-Master-Problem.
+- **Konsequenz:** Erst Masse/Verkabelung/Termination prüfen, bevor man Timing/Retries dreht. Verworfen wurden in diesem Zuge: ein **listen-before-talk-Gate** (busy-wait vor jedem Senden — hungerte den synchronen WebServer aus, bei korrekter Masse überflüssig) und die Sorge um **ESP-Selbstkollision** Poller(loop) vs. MQTT-Write(AsyncTCP) (laut Praxis durch Retries harmlos).
+- **Geplante Lösung (Stand 2026-06-09, Buck-Wandler noch nicht da):** ESP aus `12V+/12V-` des Bus-Steckers über einen **Buck-Wandler 12V→5V** speisen (Serienwiderstand ist KEINE Option — kein Konstantstrom; LDO würde 12→3,3 V verheizen). Dann liegt ESP-GND fest an `12V-` = Busmasse. Nach Umbau verifizieren: Durchgang ESP-GND ↔ `12V-` ≈ 0 Ω. Die platinenseitige 5V-Domäne ist evtl. galvanisch getrennt (Comms-/Display-Seite) → nicht per Drahtbrücke an die Busmasse zwingen, sondern sauber aus dem Bus-Stecker versorgen.
+- **Noch offen:** Erst nach dem Umbau mit gemeinsamer Masse zeigt sich, ob danach noch echte Restkollisionen vom Display übrig bleiben (siehe Praxisbefund oben) oder ob der Bus dann sauber ist.
+
 ## Lösung des Master-Konflikts: WBR3 deaktivieren
 
 Da auf die App verzichtet werden kann (Steuerung künftig über MQTT/Home Assistant), wird das Tuya-Modul stillgelegt. Damit ist der ESP32 alleiniger aktiver Master.
