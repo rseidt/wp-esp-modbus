@@ -28,8 +28,9 @@
 #define MODBUS_UNIT 1
 #define MODBUS_RETRIES 2
 // Bei Buskollisionen mit dem Tuya-Master (Invalid Slave ID / Invalid CRC / Timeout)
-// deutlich mehr Versuche, bis ein Fenster ohne Tuya-Verkehr erwischt wird.
-// Sinnvoll nur solange WBR3 noch aktiv ist; nach WBR3-Stilllegung kann auf MODBUS_RETRIES zurückgesetzt werden.
+// deutlich mehr Versuche, bis ein Fenster ohne Fremdverkehr erwischt wird.
+// Hoch lassen, auch bei stillgelegtem WBR3: das Display selbst pollt weiter gelegentlich
+// über A/B und verursacht seltene Restkollisionen. Praxis zeigt: damit laeuft es stabil.
 #define MODBUS_RETRIES_BUS_COLLISION 30
 
 // Block-Read fuer den Webserver-Registerdump.

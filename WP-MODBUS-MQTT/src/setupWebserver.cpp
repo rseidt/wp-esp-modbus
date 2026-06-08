@@ -1,6 +1,10 @@
 #include "setupWebserver.h"
 #include "modbus_base.h"
 
+// In main.cpp definiert — Umschaltung App-/MQTT-Steuerung inkl. WBR3_EN_PIN und Modbus-Poll.
+void setControlMode(bool appControl);
+bool isAppControlMode();
+
 #if defined(ARDUINO_ARCH_ESP32)
 WebServer server(80);
 #elif defined(ARDUINO_ARCH_ESP8266)
@@ -46,8 +50,50 @@ void handleRoot()
 	content += "<p>Click <a href=\"/reconfigure\">here</a> to reconfigure modbus bridge.</p>";
 	content += "<p>Click <a href=\"/update\">here</a> to update Firmware.</p>";
 	content += "<p>Click <a href=\"/modbusdump\">here</a> to create a Modbus register dump (0..200).</p>";
+	content += "<p>Click <a href=\"/control\">here</a> to switch control mode (Hersteller-App / MQTT).</p>";
 	content += "</body></html>";
 
+	server.send(200, "text/html", content);
+}
+
+// Umschalter zwischen Hersteller-App-Steuerung (WBR3D an, ESP-Poll pausiert) und
+// MQTT-Steuerung (WBR3D aus, ESP pollt). GET zeigt das Formular mit dem aktuell aktiven
+// Modus vorausgewaehlt; POST uebernimmt die Auswahl via setControlMode().
+void handleControl()
+{
+	if (server.method() == HTTP_POST)
+	{
+		bool appControl = (server.arg("mode") == "app");
+		setControlMode(appControl);
+		String content = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+		content += "<link rel=\"icon\" href=\"data:,\">";
+		content += "<style>body { font-family: Arial; text-align: center;}</style>";
+		content += "</head><body><h1>Steuerungsmodus geaendert</h1>";
+		content += appControl
+					   ? "<p>Aktiv: <b>Hersteller-App</b> (WBR3D AN, Modbus-Poll pausiert).</p>"
+					   : "<p>Aktiv: <b>MQTT</b> (WBR3D AUS, Modbus-Poll aktiv).</p>";
+		content += "<p><a href=\"/control\">Zurueck</a> | <a href=\"/\">Home</a></p>";
+		content += "</body></html>";
+		server.send(200, "text/html", content);
+		return;
+	}
+
+	bool app = isAppControlMode();
+	String content = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+	content += "<link rel=\"icon\" href=\"data:,\">";
+	content += "<style>body { font-family: Arial; text-align: center;} label{display:block;margin:1em;}</style>";
+	content += "</head><body><h1>Steuerungsmodus</h1>";
+	content += "<form method='POST' action='/control'>";
+	content += "<label><input type='radio' name='mode' value='mqtt'";
+	content += app ? "" : " checked";
+	content += "> Steuerung via MQTT (WBR3D aus, ESP pollt)</label>";
+	content += "<label><input type='radio' name='mode' value='app'";
+	content += app ? " checked" : "";
+	content += "> Steuerung via Hersteller-App (WBR3D an, ESP-Poll pausiert)</label>";
+	content += "<input type='submit' value='Uebernehmen'>";
+	content += "</form>";
+	content += "<p><a href=\"/\">Home</a></p>";
+	content += "</body></html>";
 	server.send(200, "text/html", content);
 }
 
@@ -181,6 +227,7 @@ void setupWebserver()
 	server.on("/reconfigure", handleReconfigure);
 	server.on("/update", handleUploadForm);
 	server.on("/modbusdump", handleModbusDump);
+	server.on("/control", handleControl);
 	server.on("/uploadFirmware", HTTP_POST, []()
 	{
         server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");

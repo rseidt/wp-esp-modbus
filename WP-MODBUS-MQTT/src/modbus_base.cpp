@@ -6,8 +6,10 @@ ModbusMaster modbus_client;
 
 uint16_t *register_values; // array to hold the register values
 int num_registers = sizeof(registers) / sizeof(modbus_register_t);
-int currentRegisterIndex = 0;
+int currentRangeIndex = 0;
 int currentTryIndex = 0;
+
+void checkPollRangeCoverage(); // Definition weiter unten (bei den Poll-Ranges)
 
 String *modbusResultMsg;
 uint8_t lastModbusResult = ModbusMaster::ku8MBSuccess;
@@ -87,6 +89,7 @@ void initModbus()
 	modbus_client.preTransmission(preTransmission);
 	modbus_client.postTransmission(postTransmission);
 	modbus_client.idle(modbusIdle); // waehrend des Wartens an Scheduler abgeben (WDT-Schutz)
+	checkPollRangeCoverage();		// warnt, falls ein Register von keinem pollRange abgedeckt ist
 }
 
 bool getModbusResultMsg(ModbusMaster *node, uint8_t result)
@@ -207,6 +210,26 @@ bool getModbusValue(uint16_t register_id, modbus_entity_t modbus_entity, uint16_
 	return false;
 }
 
+// Liest einen zusammenhaengenden Holding-Register-Block [start_id .. start_id+count-1] in
+// EINER Transaktion nach values[]. Genau eine Transaktion pro Aufruf — der Retry erfolgt
+// aufrufseitig ueber mehrere Poller-Ticks (wie beim Einzel-Read), damit der Loop pro Tick
+// hoechstens ~ein Modbus-Timeout blockiert und Webserver/MQTT responsiv bleiben.
+// count muss <= ku8MaxBufferSize (64) sein.
+bool getModbusBlock(uint16_t start_id, uint16_t count, uint16_t *values)
+{
+	delayMicroseconds(t3_5); // inter-frame delay for Modbus RTU
+	uint8_t result = modbus_client.readHoldingRegisters(start_id, count);
+	if (getModbusResultMsg(&modbus_client, result))
+	{
+		for (uint16_t i = 0; i < count; ++i)
+		{
+			values[i] = modbus_client.getResponseBuffer(i);
+		}
+		return true;
+	}
+	return false;
+}
+
 // Liest die Holding-Register [start_id .. start_id+count-1] block-weise in values[] und
 // vermerkt pro Register in valid[], ob der Wert gueltig ist. Gedacht fuer den Webserver-Dump.
 // Block-Reads (bis MODBUS_DUMP_CHUNK Register je Transaktion) statt Einzel-Reads → weniger
@@ -313,42 +336,105 @@ void writeFaultStatusToJson(ArduinoJson::JsonVariant variant)
 	variant["fault_active"] = any;
 }
 
+// --- Poll-Ranges fuer das Daten-JSON ---------------------------------------------------
+// Statt jedes benannte Register einzeln zu lesen, liest der Poller sie block-weise: ein
+// zusammenhaengender Range pro Tick. Das senkt die Zahl der Modbus-Transaktionen je Zyklus
+// (17 -> 3) und damit die Kollisionsfenster mit dem Tuya-Master, ohne den Loop pro Tick
+// laenger als ~ein Timeout zu blockieren (ein Block = eine Transaktion pro Tick).
+// Die Ranges muessen ALLE Adressen aus registers[] abdecken (Pruefung: checkPollRangeCoverage()).
+// Jeder Range <= ku8MaxBufferSize (64). Laut Dump sind 26..199 lueckenlos lesbar (kein Illegal
+// Data Address), 32765 ist ein gueltiger "Sensor not connected"-Wert, kein Fehler.
+typedef struct
+{
+	uint16_t start;
+	uint16_t count;
+} poll_range_t;
+
+static const poll_range_t pollRanges[] = {
+	{39, 37}, // deckt 39,41,48,50,51,52,53,54,55,64,75 ab
+	{92, 17}, // deckt 92,93,105,106,108 ab
+	{132, 1}, // deckt 132 ab
+};
+static const int num_poll_ranges = sizeof(pollRanges) / sizeof(poll_range_t);
+
+// Traegt die Werte eines gelesenen (ok=true) bzw. fehlgeschlagenen (ok=false -> 0xFFFF) Blocks
+// in register_values[] ein: fuer jedes benannte Register, dessen Adresse in den Range faellt.
+static void distributeBlock(const poll_range_t &range, const uint16_t *buf, bool ok)
+{
+	for (int i = 0; i < num_registers; ++i)
+	{
+		uint16_t id = registers[i].id;
+		if (id >= range.start && id < range.start + range.count)
+		{
+			register_values[i] = ok ? buf[id - range.start] : 0xFFFF;
+		}
+	}
+}
+
+// Entwicklungs-Pruefung: warnt einmalig, falls ein registers[]-Eintrag von keinem pollRange
+// abgedeckt wird (er wuerde sonst nie gelesen). Aendert nichts, dient nur der Wartbarkeit.
+void checkPollRangeCoverage()
+{
+	for (int i = 0; i < num_registers; ++i)
+	{
+		bool covered = false;
+		for (int r = 0; r < num_poll_ranges; ++r)
+		{
+			if (registers[i].id >= pollRanges[r].start &&
+				registers[i].id < pollRanges[r].start + pollRanges[r].count)
+			{
+				covered = true;
+				break;
+			}
+		}
+		if (!covered)
+		{
+			log(LOG_LEVEL_ERROR, "Register " + String(registers[i].name) + " (id " + String(registers[i].id) + ") liegt in keinem pollRange -> wird NICHT gelesen!");
+		}
+	}
+}
+
+// Liest pro Aufruf EINEN Poll-Range (eine Modbus-Transaktion) und verteilt die Werte auf die
+// benannten Register. Retry-Logik wie zuvor, aber pro Range statt pro Register: bei transientem
+// Fehler (Tuya-Buskollision) viele Versuche ueber die folgenden Ticks, bei echtem Slave-Fehler
+// schnell aufgeben. Gibt true zurueck, wenn ein voller Zyklus (alle Ranges) abgeschlossen ist.
 bool fillRegisterValues()
 {
-	uint16_t raw_value;
-	log(LOG_LEVEL_INFO, "Filling register " + String(registers[currentRegisterIndex].name) + " (index " + String(currentRegisterIndex) + "/" + String(num_registers - 1) + "); try " + String(currentTryIndex + 1));
-	if (getModbusValue(registers[currentRegisterIndex].id, registers[currentRegisterIndex].modbus_entity, &raw_value))
+	static uint16_t blockBuf[64]; // >= groesster pollRange.count, <= ku8MaxBufferSize
+	const poll_range_t &range = pollRanges[currentRangeIndex];
+	log(LOG_LEVEL_INFO, "Filling range " + String(range.start) + ".." + String(range.start + range.count - 1) + " (" + String(currentRangeIndex) + "/" + String(num_poll_ranges - 1) + "); try " + String(currentTryIndex + 1));
+	if (getModbusBlock(range.start, range.count, blockBuf))
 	{
-		register_values[currentRegisterIndex] = raw_value;
-		log(LOG_LEVEL_INFO, "Filled register " + String(registers[currentRegisterIndex].name) + " with value " + String(raw_value));
+		distributeBlock(range, blockBuf, true);
+		log(LOG_LEVEL_INFO, "Filled range " + String(range.start) + ".." + String(range.start + range.count - 1));
 		currentTryIndex = 0;
-		currentRegisterIndex++;
+		currentRangeIndex++;
 	}
 	else
 	{
 		// Retry-Budget abhängig vom Fehlertyp: bei Buskollision (Tuya-Master stört) viel mehr Versuche,
 		// bei echten Slave-Fehlern (Illegal Function/Address/Value, Slave Device Failure) schnell aufgeben.
 		int retry_budget = isTransientModbusError(lastModbusResult) ? MODBUS_RETRIES_BUS_COLLISION : MODBUS_RETRIES;
-		log(LOG_LEVEL_WARNING, "Failed to read register " + String(registers[currentRegisterIndex].name) + " (try " + String(currentTryIndex + 1) + "/" + String(retry_budget + 1) + ", result=0x" + String(lastModbusResult, HEX) + ")");
+		log(LOG_LEVEL_WARNING, "Failed to read range " + String(range.start) + ".." + String(range.start + range.count - 1) + " (try " + String(currentTryIndex + 1) + "/" + String(retry_budget + 1) + ", result=0x" + String(lastModbusResult, HEX) + ")");
 		if (currentTryIndex < retry_budget)
 		{
 			currentTryIndex++;
 		}
 		else
 		{
-			log(LOG_LEVEL_ERROR, "Max retries reached for register " + String(registers[currentRegisterIndex].name) + ". Moving to next register.");
-			register_values[currentRegisterIndex] = 0xFFFF; // indicate failure
+			log(LOG_LEVEL_ERROR, "Max retries reached for range " + String(range.start) + ".." + String(range.start + range.count - 1) + ". Moving to next range.");
+			distributeBlock(range, blockBuf, false); // alle Register dieses Ranges als Fehler markieren
 			currentTryIndex = 0;
-			currentRegisterIndex++;
+			currentRangeIndex++;
 		}
 	}
-	if (currentRegisterIndex < num_registers)
+	if (currentRangeIndex < num_poll_ranges)
 	{
 		return false;
 	}
 	else
 	{
-		currentRegisterIndex = 0;
+		currentRangeIndex = 0;
 		currentTryIndex = 0;
 		return true;
 	}

@@ -21,6 +21,9 @@ bool modbus_poller_paused = false;
 ulong modbus_poller_paused_millis = 0;
 bool wifiConnected = false;
 bool mqttConnected = false;
+// false = MQTT-Steuerung (WBR3D aus, ESP pollt). true = Hersteller-App (WBR3D an, ESP-Poll pausiert).
+// Default = MQTT, passend zum HIGH-Boot-Zustand von WBR3_EN_PIN. Keine Persistenz: jeder Boot startet im MQTT-Modus.
+bool appControlMode = false;
 
 int freeHeap;
 
@@ -36,6 +39,34 @@ void stopModbusPoller()
 {
 	modbus_poller_timer.cancel();
 	modbus_poller_inprogress = false;
+}
+
+// Schaltet zwischen App- und MQTT-Steuerung um und setzt entsprechend WBR3_EN_PIN.
+// Sorgt dafuer, dass nie zwei Modbus-Master gleichzeitig aktiv sind (kein Buskonflikt):
+//  - App-Modus: WBR3D AN, ESP-Poll gestoppt und Auto-Resume in loop() unterbunden.
+//  - MQTT-Modus: WBR3D AUS, ESP-Poll laeuft.
+void setControlMode(bool appControl)
+{
+	appControlMode = appControl;
+	if (appControl)
+	{
+		log(LOG_LEVEL_INFO, "Control mode: Hersteller-App (WBR3D AN, Modbus-Poll pausiert)");
+		digitalWrite(WBR3_EN_PIN, LOW); // BC547 sperrt -> Pull-up -> WBR3D EN HIGH -> WBR3D AN
+		stopModbusPoller();
+		modbus_poller_paused = false; // verhindert Auto-Resume in loop()
+	}
+	else
+	{
+		log(LOG_LEVEL_INFO, "Control mode: MQTT (WBR3D AUS, Modbus-Poll aktiv)");
+		digitalWrite(WBR3_EN_PIN, HIGH); // BC547 leitet -> WBR3D EN auf GND -> WBR3D AUS
+		modbus_poller_paused = false;
+		startModbusPoller();
+	}
+}
+
+bool isAppControlMode()
+{
+	return appControlMode;
 }
 
 void startWifiConnectTimer()
@@ -222,6 +253,12 @@ void onMqttPublish(uint16_t packetId)
 bool runModbusPollerTask(void *pvParameters)
 {
 #ifndef MODBUS_DISABLED
+	// Im App-Modus darf der ESP nicht pollen (sonst zwei Master). Defensiver Abbruch,
+	// falls beim Umschalten noch ein Task in der Timer-Queue steckt.
+	if (appControlMode)
+	{
+		return true;
+	}
 	log(LOG_LEVEL_INFO, "Entering Modbus Poller task. ");
 
 	if (modbus_poller_inprogress)
@@ -268,6 +305,11 @@ bool runModbusPollerTask(void *pvParameters)
 
 void setup()
 {
+	// So frueh wie moeglich: WBR3D stilllegen, damit der ESP32 von Anfang an alleiniger
+	// Modbus-Master ist (kein Buskonflikt mit dem Tuya-Modul). HIGH = WBR3D AUS.
+	pinMode(WBR3_EN_PIN, OUTPUT);
+	digitalWrite(WBR3_EN_PIN, HIGH);
+
 	// debug comm
 	Serial.begin(74880);
 	// while (!Serial) continue;
@@ -321,7 +363,7 @@ void loop()
 	// if Modbus poller is paused, check if we can restart it
 	int actualMillis = millis() - modbus_poller_paused_millis;
 	int pauseMillis = MODBUS_SCANRATE * 1000;
-	if (modbus_poller_paused && (actualMillis > pauseMillis))
+	if (!appControlMode && modbus_poller_paused && (actualMillis > pauseMillis))
 	{
 		log(LOG_LEVEL_INFO, "Modbus poller pause time elapsed (" + String(actualMillis) + " milliseconds since paused). Pause millis wanted: " + String(pauseMillis));
 		log(LOG_LEVEL_INFO, "Resuming Modbus poller after pause of " + String(MODBUS_SCANRATE) + " seconds.");

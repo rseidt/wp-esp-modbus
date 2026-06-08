@@ -12,6 +12,7 @@ Eine selbstgebaute ESP32-basierte Modbus-RTU/MQTT-Bridge, die eine günstige „
 - **Controller-Board:** OEM/Whitelabel, Aufdruck `SP.KYZ1.5-4.1`. Mit hoher Wahrscheinlichkeit ein Fairland/AquaForte/SPRSUN-Klon auf Tuya-Plattform.
 - **Bus:** RS485, Anschlussbuchse mit Belegung `12V- / 12V+ / A / B` (Signalleitungen A und B; G/Masse und +12V Versorgung). Zweite RS485-Buchse auf der Platine liegt physisch **parallel** zum selben Bus.
 - **ESP32:** hängt als zweiter Modbus-Master am selben A/B-Paar.
+- **WiFi-Modul der WP:** Tuya **WBR3D** (W701D-Chip), sitzt auf der Display-Platine.
 
 ## Bus-Topologie (wichtig!)
 
@@ -19,22 +20,39 @@ Eine selbstgebaute ESP32-basierte Modbus-RTU/MQTT-Bridge, die eine günstige „
   1. Das **Bedien-Display** (Master-Einheit, enthält integriertes Tuya WBR3 WiFi-Modul). Steckt an der 12V/A/B-Buchse.
   2. Der **ESP32** (unsere Bridge).
 - Der eigentliche **Slave** ist die Wärmepumpen-Hauptplatine (Kompressor, Sensoren, Ventile).
-- **Symptom:** ESP32 funktioniert einwandfrei, solange die Hersteller-App geschlossen ist. Display allein stört NICHT (pollt nicht aggressiv über A/B). Sobald die App das Tuya-Modul aufweckt, kollidieren die Anfragen → ESP32 bekommt „Invalid Slave ID" (verstümmelte Antwortframes durch Buskollision).
+- **Symptom:** ESP32 funktioniert einwandfrei, solange die Hersteller-App geschlossen ist. Sobald die App das Tuya-Modul aufweckt, kollidieren die Anfragen → ESP32 bekommt „Invalid Slave ID" (verstümmelte Antwortframes durch Buskollision).
+- **Praxisbefund (WBR3 stillgelegt):** Das Display selbst ist ein eigener Master und pollt weiter gelegentlich über A/B (nur das WiFi-Modul ist abgeschaltet, nicht die Display-MCU). Dadurch bleiben **seltene Restkollisionen** bestehen — viel weniger als bei aktiver App, aber nicht null. Im Betrieb unkritisch: die hohen Retries (`MODBUS_RETRIES_BUS_COLLISION`) fangen sie ab, die Dekodierung bleibt korrekt. Bewusst so belassen.
 
 ## Lösung des Master-Konflikts: WBR3 deaktivieren
 
 Da auf die App verzichtet werden kann (Steuerung künftig über MQTT/Home Assistant), wird das Tuya-Modul stillgelegt. Damit ist der ESP32 alleiniger aktiver Master.
 
-- Das WiFi-Modul ist ein **Tuya WBR3** (FCC-ID 2ANDL-WBR3), sitzt auf der **Display-Platine** (nicht separat ausbaubar ohne LCD-Risiko).
-- **Fix:** WBR3 **EN-Pin (Pin 3)** dauerhaft auf **GND (Pin 9)** ziehen (Drahtbrücke).
+- Das WiFi-Modul ist ein **Tuya WBR3D** (FCC-ID 2ANDL-WBR3), sitzt auf der **Display-Platine** (nicht separat ausbaubar ohne LCD-Risiko).
+- **Lösung (HARDWARE FERTIG):** WBR3D EN-Pin (Pin 3) über einen Transistor schaltbar auf GND gelegt → Tuya-Modul lässt sich vom ESP32 deaktivieren/aktivieren.
   - EN ist active-high und extern per Pull-up hochgezogen → muss aktiv auf GND gezogen werden, „abknipsen" reicht nicht.
   - Pin 3 liegt am Modulrand (3. Pin von einem Ende), gut erreichbar. Pin 9 (GND) liegt gegenüber.
   - Verbrauch im disabled-Zustand: ~1,5 µA → Modul komplett stumm.
   - Modul NICHT auslöten (LCD-Beschädigungsgefahr). Modul bleibt stecken.
   - Kein SMD-Rework nötig: Feinlötkolben (1–2 mm Spitze), dünner Draht (Kynar/Litze), Drahtbrücke Pin3→Pin9.
   - **Reversibel** möglich: kleinen Schalter/Jumper zwischen EN und GND statt fester Brücke.
-- Pin 1 vorher eindeutig identifizieren (Markierung/abgeschrägte Ecke). Bei Modulvariante (WBR3N/WBR3L/WB3S) Pinbelegung gegenprüfen.
-- **Risiko-Hinweis:** Ohne WBR3-Deaktivierung kann zudem der AMS1117-Spannungsregler auf der Platine überlastet werden.
+
+### Gelötete EN-Steuerschaltung (FERTIG, verbaut)
+BC547 NPN als Low-Side-Switch:
+- **Kollektor → WBR3D EN (Pin 3)**
+- **Emitter → GND** (WBR3D Pin 9 + ESP32 GND gemeinsam)
+- **Basis → R_B 4,7 kOhm → ESP32-GPIO**
+- **R_PD 10 kOhm** von Basis nach GND (definierter Sperr-Zustand beim Boot)
+- WBR3D-seitiger Pull-up auf EN (~9,1 kOhm gegen VCC) ist herstellerseitig vorhanden und wird mitgenutzt.
+
+**Logik:**
+- GPIO HIGH -> BC547 leitet -> EN auf GND -> **WBR3D AUS**
+- GPIO LOW / waehrend Boot -> BC547 sperrt -> Pull-up zieht EN auf 3,3 V -> **WBR3D AN**
+
+**WICHTIG fuer den Code:**
+- Gewuenschter Normalzustand = **WBR3D AUS** (fuer konfliktfreien Modbus). Daher in `setup()` so frueh wie moeglich: `pinMode(EN_PIN, OUTPUT); digitalWrite(EN_PIN, HIGH);`
+- GPIO muss ein freier Pin sein, KEIN Strapping-Pin (nicht GPIO0/2/12/15), kein input-only (nicht 34-39). Verwendet wird Pin 21
+- Wenn WBR3D aktiviert wird (z.B. fuer WP-Firmwareupdate via Hersteller-App), MUSS das ESP32-Modbus-Polling pausiert werden, sonst kehrt der Buskonflikt zurueck.
+
 
 ## Register-Mapping (Reverse Engineered)
 
@@ -159,7 +177,7 @@ Achtung: `_f`-Setpoints (DP105/106/108) sind in der Cloud-Definition Fahrenheit.
 
 ## Offene TODOs
 
-- [ ] WBR3 EN→GND-Brücke setzen, Master-Konflikt beseitigen.
+- [x] WBR3 EN→GND-Schaltung (BC547 an GPIO 21) gebaut und in Software angebunden: `WBR3_EN_PIN 21` wird in `setup()` sofort auf HIGH gesetzt (WBR3D AUS, ESP alleiniger Master). Webserver-Umschalter `/control` schaltet zwischen MQTT-Steuerung (Pin HIGH, Modbus-Poll aktiv) und Hersteller-App (Pin LOW, Modbus-Poll pausiert) — kein Buskonflikt. Master-Konflikt beseitigt.
 - [x] ~~Live-Scan Register 100–130 bei laufender Pumpe~~ → ersetzt durch 7 vollständige State-Scans 1–250 in `resources/modbus-scans/csv/`. Setpoints (Reg 105), Modus (Reg 93), Sub-Modus (Reg 132) bestätigt.
 - [x] Geräte-Fehlertabelle new_fault_01 lokalisiert: **Reg 26 (lo) / Reg 27 (hi)**, Flow-Fehler = E17 (Reg 27 Bit 0), per Display bestätigt. In `modbus_faults.h` eingetragen.
 - [ ] Umgebungstemperatur (around_temp, DP26) **weiterhin offen** — Quervergleich alt(20 °C)/neu(14 °C) ergab keinen Treffer; Reg 55 als Kandidat verworfen. Evtl. liefert die Pumpe DP26 nicht per Modbus. Reg 15/17 bleiben widerlegt.
