@@ -212,8 +212,21 @@ void onMqttUnsubscribe(uint16_t packetId)
 
 void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total)
 {
-	payload[total] = 0; // ensure null termination
-	log(LOG_LEVEL_INFO, "Message received (topic=" + String(topic) + ", qos=" + String(properties.qos) + ", dup=" + String(properties.dup) + ", retain=" + String(properties.retain) + ", len=" + String(len) + ", index=" + String(index) + ", total=" + String(total) + "): " + String(payload));
+	// Payload defensiv lesen: AsyncMqttClient liefert bei einer leeren Nachricht (z.B. einer
+	// GELOESCHTEN retained Message — MQTT loescht via Zero-Length-Retain) payload==nullptr und/oder
+	// len==0. Das fruehere payload[total]=0 schrieb dann nach Adresse 0 -> StoreProhibited-Crash
+	// (und lag ohnehin eine Stelle hinter dem nur len Bytes grossen, nicht terminierten Lib-Puffer).
+	// Daher NICHT in den Puffer schreiben, sondern nur die tatsaechlich gelieferten len Bytes kopieren.
+	String payload_s;
+	if (payload != nullptr && len > 0)
+	{
+		payload_s.reserve(len);
+		for (size_t i = 0; i < len; ++i)
+		{
+			payload_s += payload[i];
+		}
+	}
+	log(LOG_LEVEL_INFO, "Message received (topic=" + String(topic) + ", qos=" + String(properties.qos) + ", dup=" + String(properties.dup) + ", retain=" + String(properties.retain) + ", len=" + String(len) + ", index=" + String(index) + ", total=" + String(total) + "): " + payload_s);
 
 	String suffix = String(topic).substring(strlen(param_mqtt_topic) + strlen(HOSTNAME) + 9);
 	// substring(1 + strlen(MQTT_TOPIC) + strlen("/") + strlen(HOSTNAME) + strlen("/") + strlen("action"))
@@ -222,10 +235,17 @@ void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties 
 	if (suffix == "write_register")
 	{
 		log(LOG_LEVEL_INFO, "MQTT Write modbus register requested");
+		int eq = payload_s.indexOf('=');
+		if (eq < 0)
+		{
+			// Leere/ungueltige Nachricht (z.B. geloeschte retained Message) -> ignorieren,
+			// Poller NICHT anhalten.
+			log(LOG_LEVEL_WARNING, "write_register ohne gueltiges 'name=value' (Payload='" + payload_s + "') - ignoriert");
+			return;
+		}
 		stopModbusPoller();
-		String payload_s = String(payload);
-		String register_name = payload_s.substring(0, payload_s.indexOf('='));
-		String register_value = payload_s.substring(payload_s.indexOf('=') + 1);
+		String register_name = payload_s.substring(0, eq);
+		String register_value = payload_s.substring(eq + 1);
 		log(LOG_LEVEL_INFO, "Writing register name=" + String(register_name) + " with value=" + String(register_value));
 
 		if (writeModbusRegister(register_name.c_str(), register_value.toInt()))
