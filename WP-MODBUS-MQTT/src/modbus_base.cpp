@@ -14,6 +14,13 @@ void checkPollRangeCoverage(); // Definition weiter unten (bei den Poll-Ranges)
 String *modbusResultMsg;
 uint8_t lastModbusResult = ModbusMaster::ku8MBSuccess;
 
+// Cache der Fehlerregister-Rohwerte, vom Poller mitgefuellt (siehe distributeFaultBlock).
+// Index parallel zu faultRegisters[]. valid=false, bis der zugehoerige Block einmal ok gelesen wurde
+// bzw. nach einem fehlgeschlagenen Read -> writeFaultStatusToJson() ueberspringt solche Eintraege.
+static const int num_fault_regs = sizeof(faultRegisters) / sizeof(fault_register_t);
+static uint16_t faultRegValue[num_fault_regs];
+static bool faultRegValid[num_fault_regs];
+
 bool modbus_poller_task_running = false;
 
 // True für Fehler, die durch Buskollisionen mit dem Tuya-Master entstehen (verstümmelte/fremde Frames).
@@ -152,11 +159,13 @@ bool writeModbusRegister(const char *register_name, uint16_t value)
 	log(LOG_LEVEL_WARNING, "Writing data");
 	delayMicroseconds(t3_5); // inter-frame delay for Modbus RTU
 	uint16_t register_id = -1;
+	int register_index = -1;
 	for (uint8_t i = 0; i < sizeof(registers) / sizeof(modbus_register_t); ++i)
 	{
 		if (strcmp(registers[i].name, register_name) == 0)
 		{
 			register_id = registers[i].id;
+			register_index = i;
 		}
 	}
 	if (register_id == -1)
@@ -174,6 +183,13 @@ bool writeModbusRegister(const char *register_name, uint16_t value)
 		if (getModbusResultMsg(&modbus_client, result))
 		{
 			log(LOG_LEVEL_WARNING, "Data written: " + String(value) + ", Register ID: " + String(register_id));
+			// Cache mit dem (vom Slave bestaetigten) Rohwert aktualisieren, damit ein sofortiger
+			// /data-Publish den neuen Wert zeigt, OHNE den Bus erneut lesen zu muessen. Skalierung/
+			// Dekodierung passiert erst beim JSON-Bauen (writeRegisterValuesToJson), daher Rohwert.
+			if (register_index >= 0)
+			{
+				register_values[register_index] = value;
+			}
 			return true;
 		}
 		if (!isTransientModbusError(result) && i > MODBUS_RETRIES)
@@ -294,20 +310,21 @@ void writeFaultStatusToJson(ArduinoJson::JsonVariant variant)
 	JsonArray active = variant["faults"].to<JsonArray>();
 	bool any = false;
 
-	int num_fault_regs = sizeof(faultRegisters) / sizeof(fault_register_t);
 	for (int i = 0; i < num_fault_regs; ++i)
 	{
 		const fault_register_t &fr = faultRegisters[i];
 		if (fr.modbus_addr == FAULT_ADDR_TODO)
 		{
-			continue; // Adresse noch nicht identifiziert -> ueberspringen (kein Bus-Zugriff)
+			continue; // Adresse noch nicht identifiziert -> ueberspringen
 		}
 
-		uint16_t val;
-		if (!getModbusValue(fr.modbus_addr, MODBUS_TYPE_HOLDING, &val))
+		// Wert kommt aus dem Cache, den der getaktete Poller fuellt (distributeFaultBlock) — kein
+		// separater, ungetakteter Live-Read mehr (verursachte sonst pro Zyklus einen Timeout).
+		if (!faultRegValid[i])
 		{
-			continue; // Lesefehler (z.B. Buskollision) -> diesen Zyklus auslassen
+			continue; // noch nicht gelesen bzw. letzter Block-Read fehlgeschlagen
 		}
+		uint16_t val = faultRegValue[i];
 		if (val == 0)
 		{
 			continue; // keine Fehlerbits gesetzt
@@ -350,8 +367,17 @@ typedef struct
 	uint16_t count;
 } poll_range_t;
 
+// Reihenfolge egal fuer die Korrektheit; entscheidend ist der Abstand zwischen den Transaktionen
+// (MODBUS_POLL_INTERVAL_MS in main.cpp). Per Diagnose 2026-06-15 bestaetigt: dieser Slave verschluckt
+// Anfragen, die zu kurz (~100 ms) auf die vorige folgen — die jeweils ERSTE Range im Zyklus klappte
+// immer, die folgenden scheiterten im 1. Versuch (Positions- nicht Adress-abhaengig, per Reorder-Test
+// nachgewiesen). Behoben durch groesseren Poll-Tick statt durch Range-Reihenfolge.
+// Die erste Range startet bei 26 (statt 39), damit die Fehlerregister 26/27 (new_fault_01) im selben
+// getakteten Block mitgelesen werden — frueher wurden sie in writeFaultStatusToJson() live und
+// ungetaktet direkt nach dem Zyklus gelesen und liefen darum jedes Mal in einen Timeout. 26..199 ist
+// laut Dump lueckenlos lesbar; count 50 (<= ku8MaxBufferSize 64).
 static const poll_range_t pollRanges[] = {
-	{39, 37}, // deckt 39,41,48,50,51,52,53,54,55,64,75 ab
+	{26, 50}, // deckt Fehlerreg. 26,27 + 39,41,48,50,51,52,53,54,55,64,75 ab
 	{92, 17}, // deckt 92,93,105,106,108 ab
 	{132, 1}, // deckt 132 ab
 };
@@ -367,6 +393,26 @@ static void distributeBlock(const poll_range_t &range, const uint16_t *buf, bool
 		if (id >= range.start && id < range.start + range.count)
 		{
 			register_values[i] = ok ? buf[id - range.start] : 0xFFFF;
+		}
+	}
+}
+
+// Analog zu distributeBlock, aber fuer die Fehlerregister: traegt fuer jedes faultRegister mit
+// echter Adresse im Range den Rohwert in den Cache ein. So werden 26/27 im selben getakteten Block
+// gelesen wie die Normaldaten — kein separater, ungetakteter Live-Read mehr.
+static void distributeFaultBlock(const poll_range_t &range, const uint16_t *buf, bool ok)
+{
+	for (int i = 0; i < num_fault_regs; ++i)
+	{
+		uint16_t addr = faultRegisters[i].modbus_addr;
+		if (addr == FAULT_ADDR_TODO)
+		{
+			continue; // Adresse noch nicht identifiziert -> nicht im Poll-Bereich
+		}
+		if (addr >= range.start && addr < range.start + range.count)
+		{
+			faultRegValue[i] = ok ? buf[addr - range.start] : 0;
+			faultRegValid[i] = ok;
 		}
 	}
 }
@@ -406,6 +452,7 @@ bool fillRegisterValues()
 	if (getModbusBlock(range.start, range.count, blockBuf))
 	{
 		distributeBlock(range, blockBuf, true);
+		distributeFaultBlock(range, blockBuf, true);
 		log(LOG_LEVEL_INFO, "Filled range " + String(range.start) + ".." + String(range.start + range.count - 1));
 		currentTryIndex = 0;
 		currentRangeIndex++;
@@ -424,6 +471,7 @@ bool fillRegisterValues()
 		{
 			log(LOG_LEVEL_ERROR, "Max retries reached for range " + String(range.start) + ".." + String(range.start + range.count - 1) + ". Moving to next range.");
 			distributeBlock(range, blockBuf, false); // alle Register dieses Ranges als Fehler markieren
+			distributeFaultBlock(range, blockBuf, false); // ebenso die Fehlerregister dieses Ranges
 			currentTryIndex = 0;
 			currentRangeIndex++;
 		}

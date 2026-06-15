@@ -1,5 +1,6 @@
 #include "setupWebserver.h"
 #include "modbus_base.h"
+#include <LittleFS.h>
 
 // In main.cpp definiert — Umschaltung App-/MQTT-Steuerung inkl. WBR3_EN_PIN und Modbus-Poll.
 void setControlMode(bool appControl);
@@ -51,8 +52,94 @@ void handleRoot()
 	content += "<p>Click <a href=\"/update\">here</a> to update Firmware.</p>";
 	content += "<p>Click <a href=\"/modbusdump\">here</a> to create a Modbus register dump (0..200).</p>";
 	content += "<p>Click <a href=\"/control\">here</a> to switch control mode (Hersteller-App / MQTT).</p>";
+	content += "<p>Click <a href=\"/logs\">here</a> to view logs.</p>";
 	content += "</body></html>";
 
+	server.send(200, "text/html", content);
+}
+
+// Klartext-Name eines Log-Levels (siehe log.h: 1=ERROR..4=DEBUG).
+static String logLevelName(int16_t level)
+{
+	switch (level)
+	{
+	case LOG_LEVEL_ERROR:   return "ERROR";
+	case LOG_LEVEL_WARNING: return "WARNING";
+	case LOG_LEVEL_INFO:    return "INFO";
+	case LOG_LEVEL_DEBUG:   return "DEBUG";
+	default:                return "?";
+	}
+}
+
+// Streamt eine Logdatei als text/plain. Nutzt das chunked-Transfer-Muster (wie handleModbusDump),
+// damit auch 32 KB nicht als ein String im Heap landen. Liest unter logFsLock(), damit kein
+// gleichzeitiger log()-Schreibzugriff die Datei waehrend des Lesens veraendert.
+static void streamLogFile(const char *path)
+{
+	if (!logFsLock(2000))
+	{
+		server.send(503, "text/plain", "Log busy, bitte erneut versuchen.");
+		return;
+	}
+	File f = LittleFS.open(path, "r");
+	if (!f)
+	{
+		logFsUnlock();
+		server.send(404, "text/plain", "Noch keine Logdatei vorhanden.");
+		return;
+	}
+	server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+	server.send(200, "text/plain", "");
+	char buf[1025];
+	int n;
+	while ((n = f.read((uint8_t *)buf, sizeof(buf) - 1)) > 0)
+	{
+		buf[n] = '\0';
+		server.sendContent(buf);
+	}
+	f.close();
+	server.sendContent(""); // schliesst den chunked Transfer ab
+	logFsUnlock();
+}
+
+// /logs: GET zeigt aktuellen Datei-Log-Level + Umschalt-Buttons + Links zu den Logdateien.
+// POST setzt fileLogLevel (validiert 1..4). Der Datei-Log-Level ist unabhaengig von MAX_LOG_LEVEL
+// (Serial) und nur zur Laufzeit gedacht (kein Persistieren): nach Reboot wieder Default WARNING.
+void handleLogs()
+{
+	if (server.method() == HTTP_POST)
+	{
+		int lvl = server.arg("level").toInt();
+		if (lvl >= LOG_LEVEL_ERROR && lvl <= LOG_LEVEL_DEBUG)
+		{
+			fileLogLevel = (int16_t)lvl;
+			log(LOG_LEVEL_WARNING, "File log level set to " + logLevelName(fileLogLevel) + " via web");
+		}
+		String content = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+		content += "<link rel=\"icon\" href=\"data:,\"><style>body{font-family:Arial;text-align:center;}</style>";
+		content += "</head><body><h1>Log-Level geaendert</h1>";
+		content += "<p>Datei-Log-Level: <b>" + logLevelName(fileLogLevel) + "</b></p>";
+		content += "<p><a href=\"/logs\">Zurueck</a> | <a href=\"/\">Home</a></p></body></html>";
+		server.send(200, "text/html", content);
+		return;
+	}
+
+	String content = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+	content += "<link rel=\"icon\" href=\"data:,\"><style>body{font-family:Arial;text-align:center;}label{margin:0 .5em;}</style>";
+	content += "</head><body><h1>Logs</h1>";
+	content += "<p>Aktueller Datei-Log-Level: <b>" + logLevelName(fileLogLevel) + "</b></p>";
+	content += "<form method='POST' action='/logs'>";
+	for (int lvl = LOG_LEVEL_ERROR; lvl <= LOG_LEVEL_DEBUG; ++lvl)
+	{
+		content += "<label><input type='radio' name='level' value='" + String(lvl) + "'";
+		content += (lvl == fileLogLevel) ? " checked" : "";
+		content += "> " + logLevelName(lvl) + "</label>";
+	}
+	content += "<br><br><input type='submit' value='Level uebernehmen'></form>";
+	content += "<p>INFO/DEBUG nur kurz fuer Diagnose nutzen (Flash-Verschleiss).</p>";
+	content += "<hr><p><a href=\"/log/current\">Aktuelles Log anzeigen</a></p>";
+	content += "<p><a href=\"/log/previous\">Log vor letztem Reboot (pre-restart) anzeigen</a></p>";
+	content += "<p><a href=\"/\">Home</a></p></body></html>";
 	server.send(200, "text/html", content);
 }
 
@@ -228,6 +315,11 @@ void setupWebserver()
 	server.on("/update", handleUploadForm);
 	server.on("/modbusdump", handleModbusDump);
 	server.on("/control", handleControl);
+	server.on("/logs", handleLogs);
+	server.on("/log/current", []()
+			  { streamLogFile(FILE_LOG_PATH_CURRENT); });
+	server.on("/log/previous", []()
+			  { streamLogFile(FILE_LOG_PATH_PREVIOUS); });
 	server.on("/uploadFirmware", HTTP_POST, []()
 	{
         server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");

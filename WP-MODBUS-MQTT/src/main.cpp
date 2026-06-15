@@ -1,6 +1,12 @@
 #include "main.h"
 
-const int MODBUS_SCANRATE = 2; // in seconds
+const int MODBUS_SCANRATE = 1; // in seconds (Pause zwischen Poll-Zyklen; dominiert die Update-Rate)
+
+// Abstand zwischen zwei Modbus-Transaktionen (= Poll-Tick; der Poller liest einen Range je Tick).
+// Per Diagnose 2026-06-15 bestaetigt: dieser Slave verschluckt Anfragen, die zu kurz (~100 ms) auf
+// die vorige folgen -> jede Range ausser der ersten lief sonst im 1. Versuch in einen Timeout.
+// 500 ms gibt dem Slave Erholzeit. Bei verbleibenden Erstversuch-Timeouts weiter erhoehen (z.B. 1000).
+const int MODBUS_POLL_INTERVAL_MS = 500;
 
 static char HOSTNAME[12] = "ESP-MM-FFFF";
 static const char __attribute__((__unused__)) *TAG = "Main";
@@ -32,7 +38,7 @@ int freeHeap;
 void startModbusPoller()
 {
 	modbus_poller_timer.cancel();
-	modbus_poller_timer.every(100, runModbusPollerTask);
+	modbus_poller_timer.every(MODBUS_POLL_INTERVAL_MS, runModbusPollerTask);
 }
 
 void stopModbusPoller()
@@ -210,6 +216,31 @@ void onMqttUnsubscribe(uint16_t packetId)
 	log(LOG_LEVEL_INFO, "Unsubscribe acknowledged for packetId: " + String(packetId));
 }
 
+// Baut das komplette Datenmodell (Register + Fehlerstatus) aus dem aktuellen Cache
+// (register_values[]/Fault-Cache) und publisht es retained auf .../data. Liest NICHT den Bus —
+// arbeitet rein aus dem Cache. Wird vom Poller nach einem vollen Zyklus aufgerufen UND direkt nach
+// einem erfolgreichen MQTT-Write, damit der gesetzte Wert sofort (ohne Poll-Latenz) zurueckgemeldet
+// wird und kein Feedback-Loop/Flackern beim Umschalten in Home Assistant entsteht.
+void publishModbusData()
+{
+	JsonDocument json_doc;
+	writeRegisterValuesToJson(json_doc);
+	writeFaultStatusToJson(json_doc); // Geraetefehler als faults[]/fault_active in dieselbe Struktur
+	size_t json_size = measureJson(json_doc) + 1;
+	log(LOG_LEVEL_INFO, "JSON size: " + String(json_size) + " bytes");
+	char *buffer = (char *)malloc(json_size * sizeof(char));
+	size_t n = serializeJson(json_doc, buffer, json_size);
+	log(LOG_LEVEL_INFO, "JSON serialized: " + String(buffer));
+	if (mqtt_client.connected())
+	{
+		String mqtt_complete_topic = param_mqtt_topic;
+		mqtt_complete_topic += "/" + String(HOSTNAME) + "/data";
+		log(LOG_LEVEL_INFO, "MQTT Publishing data to topic: " + String(mqtt_complete_topic.c_str()));
+		mqtt_client.publish(mqtt_complete_topic.c_str(), 0, true, buffer, n);
+	}
+	free(buffer);
+}
+
 void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total)
 {
 	// Payload defensiv lesen: AsyncMqttClient liefert bei einer leeren Nachricht (z.B. einer
@@ -251,6 +282,10 @@ void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties 
 		if (writeModbusRegister(register_name.c_str(), register_value.toInt()))
 		{
 			log(LOG_LEVEL_INFO, "Register written successfully");
+			// Sofort das komplette Datenmodell aus dem Cache zurueckmelden (writeModbusRegister hat
+			// register_values[] bereits aktualisiert) — kein Bus-Read, keine Poll-Latenz. Verhindert
+			// das Feedback-Loop/Flackern beim Umschalten (HA sieht den neuen Zustand unmittelbar).
+			publishModbusData();
 		}
 		else
 		{
@@ -288,23 +323,8 @@ bool runModbusPollerTask(void *pvParameters)
 	}
 	modbus_poller_inprogress = true;
 	if (fillRegisterValues())
-	{						   // returns true if completed
-		JsonDocument json_doc; // instanciate JSON storage
-		writeRegisterValuesToJson(json_doc);
-		writeFaultStatusToJson(json_doc); // Geraetefehler als faults[]/fault_active in dieselbe Struktur
-		size_t json_size = measureJson(json_doc) + 1;
-		log(LOG_LEVEL_INFO, "JSON size: " + String(json_size) + " bytes");
-		char *buffer = (char *)malloc(json_size * sizeof(char));
-		size_t n = serializeJson(json_doc, buffer, json_size);
-		log(LOG_LEVEL_INFO, "JSON serialized: " + String(buffer));
-		if (mqtt_client.connected())
-		{
-			String mqtt_complete_topic = param_mqtt_topic;
-			mqtt_complete_topic += "/" + String(HOSTNAME) + "/data";
-			log(LOG_LEVEL_INFO, "MQTT Publishing data to topic: " + String(mqtt_complete_topic.c_str()));
-			mqtt_client.publish(mqtt_complete_topic.c_str(), 0, true, buffer, n);
-		}
-		free(buffer);
+	{ // returns true if completed
+		publishModbusData();
 		modbus_poller_paused = true;
 		modbus_poller_paused_millis = millis();
 		log(LOG_LEVEL_INFO, "Pausing Modbus poller for " + String(MODBUS_SCANRATE) + " seconds to allow other Modbus masters to communicate.");
@@ -336,6 +356,11 @@ void setup()
 	delay(500);
 	// Serial.setDebugOutput(true);
 	log(LOG_LEVEL_INFO, "Serial started at 74880 baud");
+
+	// Persistentes Datei-Logging frueh starten: mountet LittleFS, rotiert das Log des
+	// vorherigen Boots nach /log_prev.txt und beginnt /log.txt neu. Ab hier landet alles
+	// (Datei-Log-Level) auch im Flash und ist nach einem Reboot/Crash ueber /logs auslesbar.
+	initFileLog(FIRMWARE_VERSION);
 
 	setupWifiManager(false);
 	setupWebserver();

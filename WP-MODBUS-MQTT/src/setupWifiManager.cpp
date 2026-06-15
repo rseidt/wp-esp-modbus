@@ -80,7 +80,8 @@ void setupWifiManager(bool forceConfigPortal)
 		}
 		configFile.close();
 	}
-	LittleFS.end();
+	// LittleFS bleibt gemountet (kein LittleFS.end()): wird fuer das persistente Datei-Logging
+	// (initFileLog/log) dauerhaft gebraucht. Mounten passiert bereits in initFileLog().
 	// end read
 
 	// The extra parameters to be configured (can be either global or just in the setup)
@@ -162,7 +163,7 @@ void setupWifiManager(bool forceConfigPortal)
 			serializeJson(json, Serial);
 			serializeJson(json, configFile);
 			configFile.close();
-			LittleFS.end();
+			// kein LittleFS.end(): FS bleibt fuer das Datei-Logging dauerhaft gemountet.
 		}
 		else
 		{
