@@ -1,5 +1,6 @@
 #include "modbus_base.h"
 #include "modbus_faults.h"
+#include <esp_task_wdt.h>
 
 // instantiate ModbusMaster object
 ModbusMaster modbus_client;
@@ -171,9 +172,12 @@ bool writeModbusRegister(const char *register_name, uint16_t value)
 	// Transaktion und der 1. Versuch lief sonst in den ~2 s-Timeout. delay() yieldet (vTaskDelay),
 	// blockiert die CPU nicht.
 	delay(MODBUS_TX_SPACING_MS);
-	// Write tolerieren Buskollisionen: bei transienten Fehlern bis MODBUS_RETRIES_BUS_COLLISION+1 Versuche.
-	// Echte Slave-Fehler werden weiterhin nach MODBUS_RETRIES+1 Versuchen aufgegeben.
-	uint16_t max_attempts = MODBUS_RETRIES_BUS_COLLISION + 1;
+	// Write tolerieren Buskollisionen: bei transienten Fehlern bis MODBUS_WRITE_RETRIES_BUS_COLLISION+1
+	// Versuche. Echte Slave-Fehler werden weiterhin nach MODBUS_RETRIES+1 Versuchen aufgegeben.
+	// WICHTIG: niedriges Budget (nicht das hohe Read-Budget), weil diese Schleife in EINEM Aufruf
+	// laeuft und jeder writeSingleRegister ~1 Timeout per Busy-Wait blockiert -> sonst summiert sich
+	// das zu einer langen CPU-Blockade und der Task-Watchdog resettet den ESP (Crash 2026-06-16).
+	uint16_t max_attempts = MODBUS_WRITE_RETRIES_BUS_COLLISION + 1;
 	for (uint16_t i = 1; i <= max_attempts; ++i)
 	{
 		log(LOG_LEVEL_INFO, "Trial " + String(i) + "/" + String(max_attempts));
@@ -194,6 +198,17 @@ bool writeModbusRegister(const char *register_name, uint16_t value)
 		{
 			log(LOG_LEVEL_ERROR, "Permanent Modbus error (0x" + String(result, HEX) + "), giving up.");
 			return false;
+		}
+		// Vor dem naechsten Versuch yielden: writeSingleRegister blockiert per Busy-Wait ohne zu
+		// yielden, viele Versuche am Stueck liessen die IDLE-Task verhungern -> Watchdog-Reset.
+		// delay() ist vTaskDelay -> die IDLE-Task kommt dran und fuettert den Watchdog; der
+		// Abstand gibt dem Slave zugleich Zeit (wie der Inter-Transaktions-Abstand oben).
+		// esp_task_wdt_reset() fuettert den WDT zusaetzlich direkt, falls die aktuelle Task
+		// registriert ist (no-op sonst, z.B. im AsyncTCP-/MQTT-Callback-Kontext).
+		if (i < max_attempts)
+		{
+			esp_task_wdt_reset();
+			delay(MODBUS_TX_SPACING_MS);
 		}
 	}
 	log(LOG_LEVEL_ERROR, "Time out after " + String(max_attempts) + " attempts");

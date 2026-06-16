@@ -44,6 +44,15 @@ Die obige These zur Masse war richtig für die **CRC-/„Invalid Slave ID"-Fehle
 ### Debug-Infrastruktur (2026-06-15): persistentes Datei-Log
 Zur Ferndiagnose (ESP verbaut, kein Serial-Zugriff) schreibt `log()` jetzt zusätzlich ins LittleFS: `/log.txt` (aktueller Boot) + `/log_prev.txt` (vor letztem Reboot, per Rotation in `initFileLog()`), je 32 KB rollierend, NTP-Zeitstempel, Boot-Banner mit `esp_reset_reason()`. Web: `/logs` (Level-Umschalter), `/log/current`, `/log/previous`. Datei-Log-Level (`fileLogLevel`) ist zur Laufzeit umschaltbar, **getrennt** von `MAX_LOG_LEVEL` (Serial). Diagnose-Trick: kurz auf INFO stellen → „Filling range X..Y" zeigt, welche Range scheitert.
 
+### Crash behoben (2026-06-16): wiederkehrende Task-Watchdog-Resets durch blockierenden Write-Retry-Loop
+Per persistentem Datei-Log (`/log/previous`) als **`Reset reason: Task watchdog`** identifiziert — und kein Einzelfall (auch das vorherige Boot-Banner zeigte denselben Grund). **Nicht** der Heap (durchgehend ~254 k gesund → Speicherleck ausgeschlossen) und **nicht** der Read-Poller.
+
+- **Ursache = Write-Pfad** `writeModbusRegister()` in `modbus_base.cpp`: enge `for i=1..N`-Retry-Schleife in EINEM Aufruf, Budget war das hohe `MODBUS_RETRIES_BUS_COLLISION` (30). Jeder `writeSingleRegister()` blockiert ~1 Modbus-Timeout (~1–2 s) per **Busy-Wait ohne yield**. Lief ein write-naher Read/Write in den Timeout (siehe Inter-Transaktions-Timing oben), summierten sich bis zu ~30–60 s CPU-Blockade am Stück → die IDLE-Task verhungert → Task-Watchdog-Reset.
+- **Log-Signatur:** `Writing data` **ohne** folgendes `Data written` + danach ~25 s Funkstille bis zum nächsten Boot-Banner. Die `Trial i/N`-Zeilen sind INFO und stehen bei `fileLogLevel=WARNING` nicht im Datei-Log → der Sturm ist im Datei-Log unsichtbar, nur Anfang/Stille sieht man.
+- **Abgrenzung:** Der **Read-Poller** `fillRegisterValues()` ist NICHT betroffen — 1 Transaktion pro Tick, `currentTryIndex` über Ticks verteilt, blockiert nie lange. Sein hohes Budget (30) bleibt bewusst.
+- **Fix:** eigenes kleines `MODBUS_WRITE_RETRIES_BUS_COLLISION` (= 6) nur für den Write; zwischen den Versuchen `delay(MODBUS_TX_SPACING_MS)` (yieldet via `vTaskDelay` → IDLE läuft → WDT gefüttert; gibt dem Slave zugleich Abstand) + `esp_task_wdt_reset()` (greift wenn die Task registriert ist, no-op im AsyncTCP-/MQTT-Callback-Kontext). Der eigentliche Schutz ist das **yield**, der Cap begrenzt zusätzlich die Latenz.
+- **Begünstigend im Crash-Log** (nicht Ursache, aber Auslöser-Häufung): MQTT-Flapping (`Disconnected from MQTT: 0`), **leere Write-Payloads** aus Home Assistant (`write_register ohne gueltiges 'name=value' (Payload='')`) und Reg-92-Salven im ~1,5-s-Takt. Lohnt separat anzusehen.
+
 ## Lösung des Master-Konflikts: WBR3 deaktivieren
 
 Da auf die App verzichtet werden kann (Steuerung künftig über MQTT/Home Assistant), wird das Tuya-Modul stillgelegt. Damit ist der ESP32 alleiniger aktiver Master.

@@ -269,9 +269,11 @@ void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties 
 		int eq = payload_s.indexOf('=');
 		if (eq < 0)
 		{
-			// Leere/ungueltige Nachricht (z.B. geloeschte retained Message) -> ignorieren,
-			// Poller NICHT anhalten.
-			log(LOG_LEVEL_WARNING, "write_register ohne gueltiges 'name=value' (Payload='" + payload_s + "') - ignoriert");
+			// Leere/ungueltige Nachricht -> ignorieren, Poller NICHT anhalten. ERWARTETER Normalfall:
+			// ioBroker setzt das write_register-Topic nach erfolgreichem Write auf "" zurueck, damit
+			// der Broker keine retained Nachricht nachliefert, die spaeter erneut einen Write ausloest.
+			// Loest hier nichts auf dem Modbus aus -> nur INFO, kein WARNING (siehe Crash-Doku CLAUDE.md).
+			log(LOG_LEVEL_INFO, "write_register ohne gueltiges 'name=value' (Payload='" + payload_s + "') - ignoriert");
 			return;
 		}
 		stopModbusPoller();

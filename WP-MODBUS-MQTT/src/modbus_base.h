@@ -45,7 +45,16 @@
 // deutlich mehr Versuche, bis ein Fenster ohne Fremdverkehr erwischt wird.
 // Hoch lassen, auch bei stillgelegtem WBR3: das Display selbst pollt weiter gelegentlich
 // über A/B und verursacht seltene Restkollisionen. Praxis zeigt: damit laeuft es stabil.
+// Gilt NUR fuer den Read-Poller (fillRegisterValues): dort ist jeder Versuch ein eigener
+// Poll-Tick (1 Transaktion/Aufruf, currentTryIndex ueber Ticks) -> nie eine lange
+// CPU-Blockade, fuer den Watchdog harmlos.
 #define MODBUS_RETRIES_BUS_COLLISION 30
+// Eigenes, KLEINES Budget fuer den per MQTT injizierten Write (writeModbusRegister): dort
+// laufen die Versuche als enge for-Schleife in EINEM Aufruf, jeder writeSingleRegister
+// blockiert ~1 Timeout per Busy-Wait. Mit 30 Versuchen ergab das ~30-60 s CPU-Blockade ohne
+// yield -> IDLE-Task verhungert -> Task-Watchdog-Reset (Crash 2026-06-16). 6 Versuche bremst
+// das hart; zusaetzlich yieldet writeModbusRegister zwischen den Versuchen (siehe dort).
+#define MODBUS_WRITE_RETRIES_BUS_COLLISION 6
 
 // Block-Read fuer den Webserver-Registerdump.
 #define MODBUS_DUMP_CHUNK 50   // Register pro Block-Transaktion (<= ku8MaxBufferSize = 64)
