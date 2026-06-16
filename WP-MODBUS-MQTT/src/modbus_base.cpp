@@ -166,6 +166,11 @@ bool writeModbusRegister(const char *register_name, uint16_t value)
 		log(LOG_LEVEL_ERROR, "Register name '" + String(register_name) + "' not found");
 		return true;
 	}
+	// Inter-Transaktions-Abstand erzwingen (siehe Poll-Tick 500 ms): ein per MQTT injizierter Write
+	// kann direkt nach einer Poll-Transaktion kommen -> dieser Slave verschluckt die zu dicht folgende
+	// Transaktion und der 1. Versuch lief sonst in den ~2 s-Timeout. delay() yieldet (vTaskDelay),
+	// blockiert die CPU nicht.
+	delay(MODBUS_TX_SPACING_MS);
 	// Write tolerieren Buskollisionen: bei transienten Fehlern bis MODBUS_RETRIES_BUS_COLLISION+1 Versuche.
 	// Echte Slave-Fehler werden weiterhin nach MODBUS_RETRIES+1 Versuchen aufgegeben.
 	uint16_t max_attempts = MODBUS_RETRIES_BUS_COLLISION + 1;

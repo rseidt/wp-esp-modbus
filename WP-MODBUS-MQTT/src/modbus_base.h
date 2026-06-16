@@ -37,6 +37,10 @@
 #define MODBUS_TIMEOUT 1000
 #define MODBUS_UNIT 1
 #define MODBUS_RETRIES 2
+// Inter-Transaktions-Abstand vor einem per MQTT injizierten Write (wie Poll-Tick): ein Write
+// kann direkt nach einer Poll-Transaktion kommen, dieser Slave verschluckt dann die zu dicht
+// folgende Transaktion -> der 1. Versuch lief sonst in den ~2 s-Timeout.
+#define MODBUS_TX_SPACING_MS 500
 // Bei Buskollisionen mit dem Tuya-Master (Invalid Slave ID / Invalid CRC / Timeout)
 // deutlich mehr Versuche, bis ein Fenster ohne Fremdverkehr erwischt wird.
 // Hoch lassen, auch bei stillgelegtem WBR3: das Display selbst pollt weiter gelegentlich
