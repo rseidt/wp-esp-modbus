@@ -260,7 +260,10 @@ void handleModbusDump()
 {
 	static uint16_t values[MODBUS_DUMP_COUNT];
 	static bool valid[MODBUS_DUMP_COUNT];
-	readHoldingRange(MODBUS_DUMP_START, MODBUS_DUMP_COUNT, values, valid);
+	memset(valid, 0, sizeof(valid)); // Default ungueltig, falls der Dump gar nicht ausgefuehrt wird
+	// Nicht mehr direkt auf den Bus: der Modbus-Worker ist alleiniger Bus-Owner. Wir reihen einen
+	// Dump-Request ein und warten hier (HTTP-Handler) bis fertig/Timeout — kein Race mit dem Poller.
+	modbusDump(MODBUS_DUMP_START, MODBUS_DUMP_COUNT, values, valid, 20000);
 
 	server.setContentLength(CONTENT_LENGTH_UNKNOWN);
 	String head;

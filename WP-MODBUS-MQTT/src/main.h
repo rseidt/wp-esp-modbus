@@ -31,8 +31,6 @@
 #ifndef MODBUS_DISABLED
 #include <modbus_base.h>
 #endif
-void runOtaUpdateTask();
-bool runModbusPollerTask(void *pvParameters);
 bool connectToWifi(void *pvParameters);
 bool connectToMqtt(void *pvParameters);
 bool reportMemoryStatus(void *pvParameters);

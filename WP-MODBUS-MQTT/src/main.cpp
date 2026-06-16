@@ -1,12 +1,7 @@
 #include "main.h"
 
-const int MODBUS_SCANRATE = 1; // in seconds (Pause zwischen Poll-Zyklen; dominiert die Update-Rate)
-
-// Abstand zwischen zwei Modbus-Transaktionen (= Poll-Tick; der Poller liest einen Range je Tick).
-// Per Diagnose 2026-06-15 bestaetigt: dieser Slave verschluckt Anfragen, die zu kurz (~100 ms) auf
-// die vorige folgen -> jede Range ausser der ersten lief sonst im 1. Versuch in einen Timeout.
-// 500 ms gibt dem Slave Erholzeit. Bei verbleibenden Erstversuch-Timeouts weiter erhoehen (z.B. 1000).
-const int MODBUS_POLL_INTERVAL_MS = 500;
+// Modbus-Bus-Timing (MODBUS_POLL_INTERVAL_MS / MODBUS_SCANRATE_MS) liegt jetzt in modbus_base.h:
+// der Worker-Task taktet sich selbst, kein Poll-Timer mehr im Loop.
 
 static char HOSTNAME[12] = "ESP-MM-FFFF";
 static const char __attribute__((__unused__)) *TAG = "Main";
@@ -20,37 +15,21 @@ AsyncMqttClient mqtt_client;
 // instanciate timers
 Timer<1, millis> mqtt_reconnect_timer;
 Timer<1, millis> wifi_reconnect_timer;
-Timer<1, millis> modbus_poller_timer;
 Timer<1, millis> memory_report_timer;
-bool modbus_poller_inprogress = false;
-bool modbus_poller_paused = false;
-ulong modbus_poller_paused_millis = 0;
 bool wifiConnected = false;
 bool mqttConnected = false;
 // false = MQTT-Steuerung (WBR3D aus, ESP pollt). true = Hersteller-App (WBR3D an, ESP-Poll pausiert).
 // Default = MQTT, passend zum HIGH-Boot-Zustand von WBR3_EN_PIN. Keine Persistenz: jeder Boot startet im MQTT-Modus.
-bool appControlMode = false;
+// volatile: aus dem Loop-Task (setControlMode) geschrieben, aus dem Worker-Task (Core 0) gelesen.
+volatile bool appControlMode = false;
 
 int freeHeap;
 
-// Timer<1, millis> hat nur 1 Slot — defensives cancel() vor every(), damit ein bereits laufender
-// Task nicht den neuen .every()-Aufruf still verschluckt.
-void startModbusPoller()
-{
-	modbus_poller_timer.cancel();
-	modbus_poller_timer.every(MODBUS_POLL_INTERVAL_MS, runModbusPollerTask);
-}
-
-void stopModbusPoller()
-{
-	modbus_poller_timer.cancel();
-	modbus_poller_inprogress = false;
-}
-
 // Schaltet zwischen App- und MQTT-Steuerung um und setzt entsprechend WBR3_EN_PIN.
 // Sorgt dafuer, dass nie zwei Modbus-Master gleichzeitig aktiv sind (kein Buskonflikt):
-//  - App-Modus: WBR3D AN, ESP-Poll gestoppt und Auto-Resume in loop() unterbunden.
-//  - MQTT-Modus: WBR3D AUS, ESP-Poll laeuft.
+//  - App-Modus: WBR3D AN; der Modbus-Worker sieht appControlMode und fasst den Bus nicht an.
+//  - MQTT-Modus: WBR3D AUS; der Worker pollt wieder.
+// Kein Timer-Handling mehr noetig — der Worker entscheidet selbst anhand von appControlMode.
 void setControlMode(bool appControl)
 {
 	appControlMode = appControl;
@@ -58,15 +37,11 @@ void setControlMode(bool appControl)
 	{
 		log(LOG_LEVEL_INFO, "Control mode: Hersteller-App (WBR3D AN, Modbus-Poll pausiert)");
 		digitalWrite(WBR3_EN_PIN, LOW); // BC547 sperrt -> Pull-up -> WBR3D EN HIGH -> WBR3D AN
-		stopModbusPoller();
-		modbus_poller_paused = false; // verhindert Auto-Resume in loop()
 	}
 	else
 	{
 		log(LOG_LEVEL_INFO, "Control mode: MQTT (WBR3D AUS, Modbus-Poll aktiv)");
 		digitalWrite(WBR3_EN_PIN, HIGH); // BC547 leitet -> WBR3D EN auf GND -> WBR3D AUS
-		modbus_poller_paused = false;
-		startModbusPoller();
 	}
 }
 
@@ -224,8 +199,19 @@ void onMqttUnsubscribe(uint16_t packetId)
 void publishModbusData()
 {
 	JsonDocument json_doc;
-	writeRegisterValuesToJson(json_doc);
-	writeFaultStatusToJson(json_doc); // Geraetefehler als faults[]/fault_active in dieselbe Struktur
+	// Cache konsistent lesen: der Worker (Core 0) schreibt register_values[]/Fault-Cache, hier
+	// (Loop-Task) wird daraus das JSON gebaut. Kurzer Lock verhindert torn/inkonsistente Reads.
+	if (lockRegisterCache(200))
+	{
+		writeRegisterValuesToJson(json_doc);
+		writeFaultStatusToJson(json_doc); // Geraetefehler als faults[]/fault_active in dieselbe Struktur
+		unlockRegisterCache();
+	}
+	else
+	{
+		log(LOG_LEVEL_WARNING, "publishModbusData: Cache-Lock-Timeout, Publish uebersprungen");
+		return;
+	}
 	size_t json_size = measureJson(json_doc) + 1;
 	log(LOG_LEVEL_INFO, "JSON size: " + String(json_size) + " bytes");
 	char *buffer = (char *)malloc(json_size * sizeof(char));
@@ -276,24 +262,18 @@ void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties 
 			log(LOG_LEVEL_INFO, "write_register ohne gueltiges 'name=value' (Payload='" + payload_s + "') - ignoriert");
 			return;
 		}
-		stopModbusPoller();
 		String register_name = payload_s.substring(0, eq);
 		String register_value = payload_s.substring(eq + 1);
 		log(LOG_LEVEL_INFO, "Writing register name=" + String(register_name) + " with value=" + String(register_value));
 
-		if (writeModbusRegister(register_name.c_str(), register_value.toInt()))
+		// NUR einreihen, NICHT hier ausfuehren: writeModbusRegister blockiert per Busy-Wait und liefe
+		// sonst im AsyncTCP-Callback -> TCP/MQTT haengt, Task-Watchdog (Crash 2026-06-16). Der
+		// Worker-Task fuehrt den Write aus, aktualisiert den Cache und stoesst den /data-Publish an
+		// (Sofort-Feedback ohne Bus-Read) — siehe serviceRequest()/consumeModbusPublishRequest().
+		if (!enqueueModbusWrite(register_name.c_str(), (uint16_t)register_value.toInt()))
 		{
-			log(LOG_LEVEL_INFO, "Register written successfully");
-			// Sofort das komplette Datenmodell aus dem Cache zurueckmelden (writeModbusRegister hat
-			// register_values[] bereits aktualisiert) — kein Bus-Read, keine Poll-Latenz. Verhindert
-			// das Feedback-Loop/Flackern beim Umschalten (HA sieht den neuen Zustand unmittelbar).
-			publishModbusData();
+			log(LOG_LEVEL_ERROR, "Failed to enqueue write " + String(register_name) + "=" + String(register_value));
 		}
-		else
-		{
-			log(LOG_LEVEL_ERROR, "Failed to write register " + String(register_name) + " with value \"" + String(register_value) + "\"");
-		}
-		startModbusPoller();
 		return;
 	}
 	else
@@ -307,42 +287,21 @@ void onMqttPublish(uint16_t packetId)
 	log(LOG_LEVEL_INFO, "Publish acknowledged for packetId: " + String(packetId));
 }
 
-bool runModbusPollerTask(void *pvParameters)
+// Wird im Loop-Task aufgerufen, sobald der Worker neue Daten gemeldet hat (consumeModbusPublishRequest).
+// Baut /data aus dem Cache und meldet zusaetzlich den letzten Modbus-Status. Bewusst im Loop-Task,
+// damit AsyncMqttClient aus genau einem Task bedient wird (kein Cross-Task-Publish).
+void publishModbusUpdate()
 {
 #ifndef MODBUS_DISABLED
-	// Im App-Modus darf der ESP nicht pollen (sonst zwei Master). Defensiver Abbruch,
-	// falls beim Umschalten noch ein Task in der Timer-Queue steckt.
-	if (appControlMode)
-	{
-		return true;
-	}
-	log(LOG_LEVEL_INFO, "Entering Modbus Poller task. ");
-
-	if (modbus_poller_inprogress)
-	{ // not sure if needed
-		log(LOG_LEVEL_WARNING, "Modbus polling in already progress. Waiting for next cycle.");
-		return true;
-	}
-	modbus_poller_inprogress = true;
-	if (fillRegisterValues())
-	{ // returns true if completed
-		publishModbusData();
-		modbus_poller_paused = true;
-		modbus_poller_paused_millis = millis();
-		log(LOG_LEVEL_INFO, "Pausing Modbus poller for " + String(MODBUS_SCANRATE) + " seconds to allow other Modbus masters to communicate.");
-		stopModbusPoller();
-	}
+	publishModbusData();
 	String modbus_state = getModbusState();
-		if (modbus_state != "" && mqtt_client.connected())
-		{
-			String mqtt_complete_topic = param_mqtt_topic;
-			mqtt_complete_topic += "/" + String(HOSTNAME) + "/modbus_status";
-			mqtt_client.publish(mqtt_complete_topic.c_str(), 0, true, modbus_state.c_str(), modbus_state.length());
-		}
-	modbus_poller_inprogress = false;
-
+	if (modbus_state != "" && mqtt_client.connected())
+	{
+		String mqtt_complete_topic = param_mqtt_topic;
+		mqtt_complete_topic += "/" + String(HOSTNAME) + "/modbus_status";
+		mqtt_client.publish(mqtt_complete_topic.c_str(), 0, true, modbus_state.c_str(), modbus_state.length());
+	}
 #endif // MODBUS_DISABLED
-	return true;
 }
 
 void setup()
@@ -396,26 +355,21 @@ void setup()
 
 #ifndef MODBUS_DISABLED
 	initModbus();
-	startModbusPoller();
+	startModbusWorker(); // dedizierter Bus-Owner-Task (ersetzt den Poll-Timer im Loop)
 #endif // MODBUS_DISABLED
 }
-int i = 0;
+
 void loop()
 {
 	loopWebserver();
-	// log(4, "Entering main loop : "+String(i++));
 	wifi_reconnect_timer.tick();
 	mqtt_reconnect_timer.tick();
-	modbus_poller_timer.tick();
-	// if Modbus poller is paused, check if we can restart it
-	int actualMillis = millis() - modbus_poller_paused_millis;
-	int pauseMillis = MODBUS_SCANRATE * 1000;
-	if (!appControlMode && modbus_poller_paused && (actualMillis > pauseMillis))
-	{
-		log(LOG_LEVEL_INFO, "Modbus poller pause time elapsed (" + String(actualMillis) + " milliseconds since paused). Pause millis wanted: " + String(pauseMillis));
-		log(LOG_LEVEL_INFO, "Resuming Modbus poller after pause of " + String(MODBUS_SCANRATE) + " seconds.");
-		modbus_poller_paused = false;
-		startModbusPoller();
-	}
 	memory_report_timer.tick();
+#ifndef MODBUS_DISABLED
+	// Der Worker-Task signalisiert hierueber neue Daten; der Publish laeuft bewusst im Loop-Task.
+	if (consumeModbusPublishRequest())
+	{
+		publishModbusUpdate();
+	}
+#endif // MODBUS_DISABLED
 }

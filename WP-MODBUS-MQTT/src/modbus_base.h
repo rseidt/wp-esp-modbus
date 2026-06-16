@@ -60,6 +60,12 @@
 #define MODBUS_DUMP_CHUNK 50   // Register pro Block-Transaktion (<= ku8MaxBufferSize = 64)
 #define MODBUS_DUMP_RETRIES 2  // Wiederholungen pro Chunk nur bei transientem (Kollisions-)Fehler
 
+// Bus-Timing des Worker-Tasks (frueher in main.cpp). Der Worker liest eine Range pro Iteration
+// und legt zwischen den Transaktionen MODBUS_POLL_INTERVAL_MS Pause ein (Slave-Erholzeit, per
+// Diagnose 2026-06-15 bestaetigt), zwischen vollen Poll-Zyklen MODBUS_SCANRATE_MS.
+#define MODBUS_POLL_INTERVAL_MS 500
+#define MODBUS_SCANRATE_MS 1000
+
 
 void preTransmission();
 void postTransmission();
@@ -70,4 +76,21 @@ void writeRegisterValuesToJson(ArduinoJson::JsonVariant variant);
 String getModbusState();
 bool readHoldingRange(uint16_t start_id, uint16_t count, uint16_t *values, bool *valid);
 void writeFaultStatusToJson(ArduinoJson::JsonVariant variant);
+
+// --- Modbus-Worker-Task (alleiniger Bus-Owner) + Request-API ---------------------------
+// Genau EIN FreeRTOS-Task besitzt den RS485-Bus. Poll, Write und Web-Dump werden zu Requests,
+// die hier serialisiert ausgefuehrt werden. Das beseitigt die Cross-Task-Bus-Races (Loop-Poller
+// vs. AsyncTCP-Write) und holt das blockierende Busy-Wait aus dem AsyncTCP-Callback.
+void startModbusWorker();
+// Reiht einen Schreibbefehl ein (non-blocking, aus jedem Task — z.B. dem MQTT-Callback).
+bool enqueueModbusWrite(const char *register_name, uint16_t value);
+// Fuehrt einen Register-Dump ueber den Worker aus und blockiert den Aufrufer bis Fertig/Timeout.
+bool modbusDump(uint16_t start_id, uint16_t count, uint16_t *values, bool *valid, uint32_t timeout_ms);
+// loop() pollt das: liefert einmal true, nachdem der Worker neue Daten bereitgestellt hat
+// (voller Poll-Zyklus oder bestaetigter Write) -> publishModbusData() laeuft so im Loop-Task.
+bool consumeModbusPublishRequest();
+// Schuetzt register_values[]/Fault-Cache: der Worker schreibt darunter, Leser (publishModbusData)
+// nehmen es kurz fuer einen konsistenten Snapshot.
+bool lockRegisterCache(uint32_t timeout_ms);
+void unlockRegisterCache();
 #endif // SRC_MODBUS_BASE_H_

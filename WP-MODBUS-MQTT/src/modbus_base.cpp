@@ -2,6 +2,10 @@
 #include "modbus_faults.h"
 #include <esp_task_wdt.h>
 
+// In main.cpp definiert: true, solange die Hersteller-App den Bus besitzt (WBR3D an). Der Worker
+// fasst dann den Bus NICHT an. Hier extern deklariert statt main.h einzubinden (vermeidet Zyklus).
+bool isAppControlMode();
+
 // instantiate ModbusMaster object
 ModbusMaster modbus_client;
 
@@ -23,6 +27,25 @@ static uint16_t faultRegValue[num_fault_regs];
 static bool faultRegValid[num_fault_regs];
 
 bool modbus_poller_task_running = false;
+
+// Schuetzt register_values[] + Fault-Cache. Geschrieben wird ausschliesslich vom Worker-Task
+// (distributeBlock/distributeFaultBlock/writeModbusRegister-Cacheupdate); gelesen wird beim
+// JSON-Bauen aus dem Loop-Task (publishModbusData). Nur kurze Halte -> nie waehrend der Bus-I/O.
+static SemaphoreHandle_t registerCacheMutex = nullptr;
+
+bool lockRegisterCache(uint32_t timeout_ms)
+{
+	return registerCacheMutex != nullptr &&
+		   xSemaphoreTake(registerCacheMutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+void unlockRegisterCache()
+{
+	if (registerCacheMutex != nullptr)
+	{
+		xSemaphoreGive(registerCacheMutex);
+	}
+}
 
 // True für Fehler, die durch Buskollisionen mit dem Tuya-Master entstehen (verstümmelte/fremde Frames).
 // Diese werden weggeworfen und sofort erneut versucht — der Slave selbst hat das Frame nie gesehen.
@@ -190,7 +213,11 @@ bool writeModbusRegister(const char *register_name, uint16_t value)
 			// Dekodierung passiert erst beim JSON-Bauen (writeRegisterValuesToJson), daher Rohwert.
 			if (register_index >= 0)
 			{
-				register_values[register_index] = value;
+				if (lockRegisterCache(100))
+				{
+					register_values[register_index] = value;
+					unlockRegisterCache();
+				}
 			}
 			return true;
 		}
@@ -464,8 +491,12 @@ bool fillRegisterValues()
 	log(LOG_LEVEL_INFO, "Filling range " + String(range.start) + ".." + String(range.start + range.count - 1) + " (" + String(currentRangeIndex) + "/" + String(num_poll_ranges - 1) + "); try " + String(currentTryIndex + 1));
 	if (getModbusBlock(range.start, range.count, blockBuf))
 	{
-		distributeBlock(range, blockBuf, true);
-		distributeFaultBlock(range, blockBuf, true);
+		if (lockRegisterCache(100))
+		{
+			distributeBlock(range, blockBuf, true);
+			distributeFaultBlock(range, blockBuf, true);
+			unlockRegisterCache();
+		}
 		log(LOG_LEVEL_INFO, "Filled range " + String(range.start) + ".." + String(range.start + range.count - 1));
 		currentTryIndex = 0;
 		currentRangeIndex++;
@@ -483,8 +514,12 @@ bool fillRegisterValues()
 		else
 		{
 			log(LOG_LEVEL_ERROR, "Max retries reached for range " + String(range.start) + ".." + String(range.start + range.count - 1) + ". Moving to next range.");
-			distributeBlock(range, blockBuf, false); // alle Register dieses Ranges als Fehler markieren
-			distributeFaultBlock(range, blockBuf, false); // ebenso die Fehlerregister dieses Ranges
+			if (lockRegisterCache(100))
+			{
+				distributeBlock(range, blockBuf, false); // alle Register dieses Ranges als Fehler markieren
+				distributeFaultBlock(range, blockBuf, false); // ebenso die Fehlerregister dieses Ranges
+				unlockRegisterCache();
+			}
 			currentTryIndex = 0;
 			currentRangeIndex++;
 		}
@@ -588,5 +623,199 @@ void writeRegisterValuesToJson(ArduinoJson::JsonVariant variant)
 		{
 			log(LOG_LEVEL_ERROR, "Request failed!");
 		}
+	}
+}
+
+// =========================================================================================
+// Modbus-Worker-Task: alleiniger Besitzer des RS485-Busses.
+// Poll-Read, MQTT-Write und Web-Dump werden zu Requests in einer FreeRTOS-Queue und HIER
+// serialisiert ausgefuehrt. Dadurch fasst nur dieser Task modbus_client/UART an -> keine
+// Cross-Task-Bus-Races mehr; das blockierende Busy-Wait des Writes liegt nicht mehr im
+// AsyncTCP-Callback (war Ursache des Task-Watchdog-Resets 2026-06-16).
+// =========================================================================================
+
+enum ModbusReqType
+{
+	MB_REQ_WRITE,
+	MB_REQ_DUMP
+};
+
+struct ModbusRequest
+{
+	ModbusReqType type;
+	char name[32];          // WRITE: Registername
+	uint16_t value;         // WRITE: Rohwert
+	uint16_t start;         // DUMP:  Startadresse
+	uint16_t count;         // DUMP:  Anzahl
+	uint16_t *values;       // DUMP:  Zielpuffer (Aufrufer haelt ihn bis done)
+	bool *valid;            // DUMP:  Gueltigkeitsflags
+	volatile bool *ok;      // DUMP:  Ergebnis
+	SemaphoreHandle_t done; // DUMP:  Completion-Signal
+};
+
+static QueueHandle_t modbusRequestQueue = nullptr;
+static TaskHandle_t modbusWorkerHandle = nullptr;
+static volatile bool g_modbusPublishRequested = false;
+
+// Vom Worker gesetzt, sobald neue Daten im Cache stehen. loop() konsumiert es und ruft
+// publishModbusData() im Loop-Task (so wird AsyncMqttClient aus genau einem Task bedient).
+static void requestPublish()
+{
+	g_modbusPublishRequested = true;
+}
+
+bool consumeModbusPublishRequest()
+{
+	if (g_modbusPublishRequested)
+	{
+		g_modbusPublishRequested = false;
+		return true;
+	}
+	return false;
+}
+
+bool enqueueModbusWrite(const char *register_name, uint16_t value)
+{
+	if (modbusRequestQueue == nullptr)
+	{
+		return false;
+	}
+	ModbusRequest req = {};
+	req.type = MB_REQ_WRITE;
+	strncpy(req.name, register_name, sizeof(req.name) - 1);
+	req.value = value;
+	if (xQueueSend(modbusRequestQueue, &req, 0) != pdTRUE)
+	{
+		log(LOG_LEVEL_ERROR, "Modbus-Write-Queue voll, Write verworfen: " + String(register_name));
+		return false;
+	}
+	return true;
+}
+
+bool modbusDump(uint16_t start_id, uint16_t count, uint16_t *values, bool *valid, uint32_t timeout_ms)
+{
+	if (modbusRequestQueue == nullptr)
+	{
+		return false;
+	}
+	// Statisches Completion-Signal (nie geloescht -> kein Use-after-free, falls ein Timeout den
+	// Aufrufer vor dem Worker zuruecklaesst). Der synchrone Webserver ruft das einzeln auf.
+	static SemaphoreHandle_t dumpDone = nullptr;
+	if (dumpDone == nullptr)
+	{
+		dumpDone = xSemaphoreCreateBinary();
+	}
+	xSemaphoreTake(dumpDone, 0); // evtl. Altsignal abraeumen
+	volatile bool ok = false;
+	ModbusRequest req = {};
+	req.type = MB_REQ_DUMP;
+	req.start = start_id;
+	req.count = count;
+	req.values = values;
+	req.valid = valid;
+	req.ok = &ok;
+	req.done = dumpDone;
+	if (xQueueSend(modbusRequestQueue, &req, pdMS_TO_TICKS(timeout_ms)) != pdTRUE)
+	{
+		return false;
+	}
+	if (xSemaphoreTake(dumpDone, pdMS_TO_TICKS(timeout_ms)) != pdTRUE)
+	{
+		log(LOG_LEVEL_ERROR, "Modbus-Dump Timeout");
+		return false;
+	}
+	return ok;
+}
+
+static void serviceRequest(const ModbusRequest &req)
+{
+	if (req.type == MB_REQ_WRITE)
+	{
+		if (writeModbusRegister(req.name, req.value))
+		{
+			requestPublish(); // Sofort-Feedback aus dem Cache (kein Bus-Read noetig)
+		}
+	}
+	else // MB_REQ_DUMP
+	{
+		bool ok = readHoldingRange(req.start, req.count, req.values, req.valid);
+		if (req.ok != nullptr)
+		{
+			*req.ok = ok;
+		}
+		if (req.done != nullptr)
+		{
+			xSemaphoreGive(req.done);
+		}
+	}
+}
+
+static void modbusWorkerTask(void *)
+{
+	// Bewusst NICHT beim Task-Watchdog registriert: ein langer /modbusdump (mehrere Chunks in
+	// einem Durchlauf) liefe sonst Gefahr, >5 s ohne Reset zu brauchen -> falscher TWDT-Reset.
+	// Der Watchdog-Schutz kommt stattdessen vom Yielden: jede Iteration endet mit vTaskDelay und
+	// waehrend der Bus-Wartezeit yieldet modbusIdle() (delay(1)) -> die IDLE-Task laeuft und
+	// fuettert den (IDLE-)Watchdog. Genau das Yielden war der Kern des Fixes von 2026-06-16.
+	for (;;)
+	{
+		// App-Modus: der Bus gehoert der Hersteller-App (WBR3D an) -> nicht anfassen. Anstehende
+		// Requests sofort fehlschlagend quittieren, damit Aufrufer nicht in den Timeout laufen.
+		if (isAppControlMode())
+		{
+			ModbusRequest req;
+			while (xQueueReceive(modbusRequestQueue, &req, 0) == pdTRUE)
+			{
+				if (req.type == MB_REQ_DUMP)
+				{
+					if (req.ok != nullptr) *req.ok = false;
+					if (req.done != nullptr) xSemaphoreGive(req.done);
+				}
+				else
+				{
+					log(LOG_LEVEL_WARNING, "Write im App-Modus verworfen: " + String(req.name));
+				}
+			}
+			vTaskDelay(pdMS_TO_TICKS(200));
+			continue;
+		}
+
+		// Requests haben Vorrang vor dem Poll (Schaltbefehle reagieren ohne Poll-Latenz).
+		ModbusRequest req;
+		if (xQueueReceive(modbusRequestQueue, &req, 0) == pdTRUE)
+		{
+			serviceRequest(req);
+			vTaskDelay(pdMS_TO_TICKS(MODBUS_TX_SPACING_MS)); // Bus-Abstand nach der Transaktion
+			continue;
+		}
+
+		// Sonst: eine Poll-Range lesen (fillRegisterValues = genau eine Transaktion pro Aufruf).
+		bool cycleDone = fillRegisterValues();
+		if (cycleDone)
+		{
+			requestPublish();
+			vTaskDelay(pdMS_TO_TICKS(MODBUS_SCANRATE_MS)); // Pause zwischen vollen Poll-Zyklen
+		}
+		else
+		{
+			vTaskDelay(pdMS_TO_TICKS(MODBUS_POLL_INTERVAL_MS)); // Abstand zwischen Transaktionen
+		}
+	}
+}
+
+void startModbusWorker()
+{
+	if (registerCacheMutex == nullptr)
+	{
+		registerCacheMutex = xSemaphoreCreateMutex();
+	}
+	if (modbusRequestQueue == nullptr)
+	{
+		modbusRequestQueue = xQueueCreate(8, sizeof(ModbusRequest));
+	}
+	if (modbusWorkerHandle == nullptr)
+	{
+		// Auf Core 0 (neben AsyncTCP), damit Loop/WebServer auf Core 1 ungestoert bleiben.
+		xTaskCreatePinnedToCore(modbusWorkerTask, "modbusWorker", 4096, nullptr, 2, &modbusWorkerHandle, 0);
 	}
 }
