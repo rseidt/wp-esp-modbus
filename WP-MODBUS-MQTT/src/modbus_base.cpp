@@ -11,7 +11,7 @@ int currentTryIndex = 0;
 
 void checkPollRangeCoverage(); // Definition weiter unten (bei den Poll-Ranges)
 
-String *modbusResultMsg;
+String modbusResultMsg;
 uint8_t lastModbusResult = ModbusMaster::ku8MBSuccess;
 
 // Cache der Fehlerregister-Rohwerte, vom Poller mitgefuellt (siehe distributeFaultBlock).
@@ -106,7 +106,7 @@ bool getModbusResultMsg(ModbusMaster *node, uint8_t result)
 	switch (result)
 	{
 	case node->ku8MBSuccess:
-		modbusResultMsg = new String(tmpstr2);
+		modbusResultMsg = tmpstr2;
 		return true;
 		break;
 	case node->ku8MBIllegalFunction:
@@ -138,20 +138,13 @@ bool getModbusResultMsg(ModbusMaster *node, uint8_t result)
 		break;
 	}
 	log(LOG_LEVEL_ERROR, tmpstr2);
-	modbusResultMsg = new String(tmpstr2);
+	modbusResultMsg = tmpstr2;
 	return false;
 }
 
 String getModbusState()
 {
-	if (modbusResultMsg != nullptr)
-	{
-		return *modbusResultMsg;
-	}
-	else
-	{
-		return "";
-	}
+	return modbusResultMsg;
 }
 
 bool writeModbusRegister(const char *register_name, uint16_t value)
