@@ -104,7 +104,7 @@ bool reportMemoryStatus(void *pvParameters)
 	{
 		String mqtt_complete_topic = param_mqtt_topic;
 		mqtt_complete_topic += "/" + String(HOSTNAME) + "/status";
-		log(LOG_LEVEL_WARNING, "MQTT Publishing data to topic " + mqtt_complete_topic + ": " + json);
+		log(LOG_LEVEL_INFO, "MQTT Publishing data to topic " + mqtt_complete_topic + ": " + json);
 		mqtt_client.publish(mqtt_complete_topic.c_str(), 0, true, json.c_str(), json.length());
 	}
 	return true;
