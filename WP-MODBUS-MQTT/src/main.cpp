@@ -7,7 +7,7 @@ static char HOSTNAME[12] = "ESP-MM-FFFF";
 static const char __attribute__((__unused__)) *TAG = "Main";
 
 // static const char *FIRMWARE_URL = "https://domain.com/path/file.bin";
-static const char *FIRMWARE_VERSION = "000.000.024";
+static const char *FIRMWARE_VERSION = "000.000.025";
 
 // instanciate AsyncMqttClient object
 AsyncMqttClient mqtt_client;
@@ -24,6 +24,13 @@ bool mqttConnected = false;
 volatile bool appControlMode = false;
 
 int freeHeap;
+
+// Flap-Zaehler fuer die Ferndiagnose der Link-Stabilitaet (im /status-JSON exponiert). Steigen sie
+// im Gleichschritt mit zunehmender Traegheit, ist der Link die Ursache. mqtt/wifiDisconnectCount aus
+// den jeweiligen Callbacks; webserverRestartCount aus restartWebserver() (extern, setupWebserver.cpp).
+volatile uint32_t mqttDisconnectCount = 0;
+volatile uint32_t wifiDisconnectCount = 0;
+extern volatile uint32_t webserverRestartCount;
 
 // Schaltet zwischen App- und MQTT-Steuerung um und setzt entsprechend WBR3_EN_PIN.
 // Sorgt dafuer, dass nie zwei Modbus-Master gleichzeitig aktiv sind (kein Buskonflikt):
@@ -97,6 +104,14 @@ bool reportMemoryStatus(void *pvParameters)
 	}
 	String json = "{";
 	json += "\"freeHeap\":" + String(freeHeap) + ",";
+	json += "\"minFreeHeap\":" + String(ESP.getMinFreeHeap()) + ",";
+	// rssi: WLAN-Signalstaerke in dBm (näher an 0 = besser; < -75 dBm = schwach). Diagnostiziert,
+	// ob Rest-Latenz/Drops trotz WiFi.setSleep(false) an einem schwachen Link liegen.
+	json += "\"rssi\":" + String(WiFi.isConnected() ? WiFi.RSSI() : 0) + ",";
+	// Flap-Zaehler seit Boot: steigen sie synchron mit zunehmender Traegheit -> Link instabil.
+	json += "\"mqttDisconnects\":" + String(mqttDisconnectCount) + ",";
+	json += "\"wifiDisconnects\":" + String(wifiDisconnectCount) + ",";
+	json += "\"webserverRestarts\":" + String(webserverRestartCount) + ",";
 	json += "\"uptime\":" + String(millis() / 1000) + ",";
 	json += "\"time\":\"" + String(now.tm_year + 1900) + "-" + String(now.tm_mon + 1) + "-" + String(now.tm_mday) + " " + String(now.tm_hour) + ":" + String(now.tm_min) + ":" + String(now.tm_sec) + "\"";
 	json += "}";
@@ -154,6 +169,7 @@ void onMqttConnect(bool sessionPresent)
 
 void onMqttDisconnect(AsyncMqttClientDisconnectReason reason)
 {
+	mqttDisconnectCount++;
 	log(LOG_LEVEL_WARNING, "Disconnected from MQTT: " + String((int)reason));
 	// Timer immer starten — connect() failt solange WLAN weg ist, retried aber alle 2 s automatisch.
 	// Zusätzlich triggert der WiFi-Event-Handler den Connect bei STA_GOT_IP.
@@ -169,6 +185,7 @@ void wiFiEvent(WiFiEvent_t event)
 	switch (event)
 	{
 	case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+		wifiDisconnectCount++;
 		log(LOG_LEVEL_WARNING, "WiFi disconnected");
 		break;
 	case ARDUINO_EVENT_WIFI_STA_GOT_IP:
@@ -339,6 +356,13 @@ void setup()
 	log(LOG_LEVEL_INFO, "Hostname: " + String(HOSTNAME));
 
 	WiFi.onEvent(wiFiEvent);
+
+	// WiFi-Modem-Sleep abschalten. Default ist WIFI_PS_MIN_MODEM: der Funk schlaeft zwischen
+	// DTIM-Beacons und weckt nur verzoegert auf -> eingehende Pakete stauen sich, RTT springt auf
+	// Sekunden (per Ping bestaetigt: 0 % Loss, aber 200 ms..4 s steigend). Folge: traeger
+	// synchroner Webserver und periodische MQTT-Keepalive-Abbrueche (reason 0). Der ESP wird per
+	// Buck-Wandler aus dem Bus versorgt -> der Mehrverbrauch (~20-30 mA) ist irrelevant.
+	WiFi.setSleep(false);
 
 	mqtt_client.onConnect(onMqttConnect);
 	mqtt_client.onDisconnect(onMqttDisconnect);

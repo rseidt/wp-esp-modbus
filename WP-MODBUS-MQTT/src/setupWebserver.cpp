@@ -12,6 +12,10 @@ WebServer server(80);
 ESP8266WebServer server(80);
 #endif
 
+// Zaehlt die Neu-Bindungen des Listen-Sockets (bei jedem WiFi-GOT_IP). Wird in main.cpp im
+// /status-JSON exponiert (Flap-Diagnose). volatile: aus dem Loop-Task geschrieben/gelesen.
+volatile uint32_t webserverRestartCount = 0;
+
 // Registerdump 0..200 (= 201 Register). Der Bus wird einmal beim Seitenaufruf gescannt
 // und direkt in die HTML-Tabelle gerendert. Der CSV-Download wird client-seitig aus genau
 // dieser Tabelle erzeugt (siehe dlcsv() im HTML) → eine Datenquelle, kein server-seitiger State.
@@ -306,6 +310,35 @@ void handleModbusDump()
 	server.sendContent(""); // schliesst den chunked Transfer ab
 }
 
+// /reboot: GET zeigt einen Bestaetigungs-Button, POST startet den ESP neu. Bewusst nur per POST
+// (kein Reboot durch versehentlichen GET/Browser-Prefetch). Antwort wird vor dem Neustart noch
+// geflusht; delay() gibt dem TCP-Stack Zeit, die Seite auszuliefern.
+void handleReboot()
+{
+	if (server.method() == HTTP_POST)
+	{
+		log(LOG_LEVEL_WARNING, "Reboot via web requested");
+		String content = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+		content += "<link rel=\"icon\" href=\"data:,\"><style>body{font-family:Arial;text-align:center;}</style>";
+		content += "</head><body><h1>Neustart...</h1>";
+		content += "<p>Der ESP startet neu. <a href=\"/\">Home</a> (nach ein paar Sekunden erneut laden).</p>";
+		content += "</body></html>";
+		server.send(200, "text/html", content);
+		server.client().flush();
+		delay(200);
+		ESP.restart();
+		return;
+	}
+
+	String content = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+	content += "<link rel=\"icon\" href=\"data:,\"><style>body{font-family:Arial;text-align:center;}</style>";
+	content += "</head><body><h1>Neustart</h1>";
+	content += "<p>ESP wirklich neu starten?</p>";
+	content += "<form method='POST' action='/reboot'><input type='submit' value='Jetzt neu starten'></form>";
+	content += "<p><a href=\"/\">Abbrechen</a></p></body></html>";
+	server.send(200, "text/html", content);
+}
+
 void loopWebserver()
 {
 	server.handleClient();
@@ -318,6 +351,7 @@ void setupWebserver()
 	server.on("/update", handleUploadForm);
 	server.on("/modbusdump", handleModbusDump);
 	server.on("/control", handleControl);
+	server.on("/reboot", handleReboot);
 	server.on("/logs", handleLogs);
 	server.on("/log/current", []()
 			  { streamLogFile(FILE_LOG_PATH_CURRENT); });
@@ -338,5 +372,6 @@ void restartWebserver()
 {
 	server.close();
 	server.begin();
+	webserverRestartCount++;
 	log(LOG_LEVEL_INFO, "Webserver re-bound on port 80");
 }
