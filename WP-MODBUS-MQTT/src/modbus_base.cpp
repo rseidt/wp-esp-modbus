@@ -657,6 +657,18 @@ static QueueHandle_t modbusRequestQueue = nullptr;
 static TaskHandle_t modbusWorkerHandle = nullptr;
 static volatile bool g_modbusPublishRequested = false;
 
+// --- Loop-Heartbeat-Waechter -----------------------------------------------------------
+// Der Loop-Task ruft feedLoopHeartbeat() jede Iteration; der Worker (Core 0, laeuft unabhaengig
+// weiter, auch wenn der Loop haengt) prueft das Alter und rebootet bei Stillstand kontrolliert.
+// Siehe LOOP_HEARTBEAT_TIMEOUT_MS in modbus_base.h. Baseline wird in startModbusWorker() gesetzt,
+// damit der erste Check eine volle Karenzzeit hat (kein Fehl-Reboot im Anlauf).
+static volatile uint32_t g_lastLoopHeartbeatMs = 0;
+
+void feedLoopHeartbeat()
+{
+	g_lastLoopHeartbeatMs = millis();
+}
+
 // Vom Worker gesetzt, sobald neue Daten im Cache stehen. loop() konsumiert es und ruft
 // publishModbusData() im Loop-Task (so wird AsyncMqttClient aus genau einem Task bedient).
 static void requestPublish()
@@ -759,6 +771,28 @@ static void modbusWorkerTask(void *)
 	// fuettert den (IDLE-)Watchdog. Genau das Yielden war der Kern des Fixes von 2026-06-16.
 	for (;;)
 	{
+		// Loop-Heartbeat pruefen: bleibt der Loop-Task laenger als LOOP_HEARTBEAT_TIMEOUT_MS stehen
+		// (eingefroren -> kein Status-Publish, kein handleClient, aber kein Watchdog feuert), den
+		// ESP kontrolliert neu starten = Selbstheilung statt manuellem Stromstecken. Bewusst hier
+		// VOR der App-Modus-Pruefung, damit der Waechter auch im App-Modus aktiv bleibt. Unsigned-
+		// Subtraktion ist rollover-sicher. ESP.restart() -> Reset-Grund "Software reset"; die
+		// ERROR-Zeile landet im File-Log (>= WARNING) -> nach dem Reboot in /log/previous sichtbar.
+		uint32_t now = millis();
+		uint32_t last = g_lastLoopHeartbeatMs; // einmal lesen — der Loop-Task (Core 1) schreibt es nebenlaeufig
+		// Differenz SIGNED auswerten: rollover- UND cross-core-skew-sicher. 'last' kann durch das
+		// Core-uebergreifende Timing minimal (wenige ms) > now sein (der Loop feedet zwischen unserem
+		// millis()- und unserem last-Read), die Differenz dann leicht negativ. Mit unsigned wurde
+		// daraus ~4,29e9 ms und loeste einen FEHL-Reboot aus (Log 2026-06-21 13:34:32: "seit
+		// 4294967294 ms" = (uint32_t)(-2)). Signed-Vergleich wertet nur einen echten, langen
+		// Stillstand als Timeout; ein knapp negativer Wert bleibt harmlos unter der Schwelle.
+		int32_t sinceHeartbeat = (int32_t)(now - last);
+		if (sinceHeartbeat > (int32_t)LOOP_HEARTBEAT_TIMEOUT_MS)
+		{
+			log(LOG_LEVEL_ERROR, "Loop-Heartbeat seit " + String(sinceHeartbeat) + " ms aus -> Loop-Task eingefroren, ESP.restart()");
+			delay(100); // Sicherheitsmarge fuers File-Log-Flush vor dem Neustart
+			ESP.restart();
+		}
+
 		// App-Modus: der Bus gehoert der Hersteller-App (WBR3D an) -> nicht anfassen. Anstehende
 		// Requests sofort fehlschlagend quittieren, damit Aufrufer nicht in den Timeout laufen.
 		if (isAppControlMode())
@@ -813,6 +847,9 @@ void startModbusWorker()
 	{
 		modbusRequestQueue = xQueueCreate(8, sizeof(ModbusRequest));
 	}
+	// Heartbeat-Baseline: gibt dem Waechter eine volle Karenzzeit, bevor der Loop-Task das erste
+	// Mal feedet (kein Fehl-Reboot, falls der Loop im Anlauf kurz spaeter dran ist).
+	g_lastLoopHeartbeatMs = millis();
 	if (modbusWorkerHandle == nullptr)
 	{
 		// Auf Core 0 (neben AsyncTCP), damit Loop/WebServer auf Core 1 ungestoert bleiben.

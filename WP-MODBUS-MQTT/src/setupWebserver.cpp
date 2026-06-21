@@ -57,6 +57,7 @@ void handleRoot()
 	content += "<p>Click <a href=\"/modbusdump\">here</a> to create a Modbus register dump (0..200).</p>";
 	content += "<p>Click <a href=\"/control\">here</a> to switch control mode (Hersteller-App / MQTT).</p>";
 	content += "<p>Click <a href=\"/logs\">here</a> to view logs.</p>";
+	content += "<p>Click <a href=\"/reboot\">here</a> to reboot the ESP.</p>";
 	content += "</body></html>";
 
 	server.send(200, "text/html", content);

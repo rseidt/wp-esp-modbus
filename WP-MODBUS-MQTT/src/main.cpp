@@ -390,6 +390,9 @@ void loop()
 	mqtt_reconnect_timer.tick();
 	memory_report_timer.tick();
 #ifndef MODBUS_DISABLED
+	// Heartbeat fuer den Worker-Watchdog: solange der Loop-Task laeuft, wird der Zeitstempel
+	// aktualisiert. Bleibt er aus (eingefrorener Loop), rebootet der Worker den ESP (Selbstheilung).
+	feedLoopHeartbeat();
 	// Der Worker-Task signalisiert hierueber neue Daten; der Publish laeuft bewusst im Loop-Task.
 	if (consumeModbusPublishRequest())
 	{

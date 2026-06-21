@@ -66,6 +66,17 @@
 #define MODBUS_POLL_INTERVAL_MS 500
 #define MODBUS_SCANRATE_MS 1000
 
+// Loop-Heartbeat-Waechter: der Loop-Task ruft feedLoopHeartbeat() jede Iteration. Der Worker-Task
+// (laeuft unabhaengig auf Core 0 weiter, auch wenn der Loop haengt) rebootet den ESP, falls der
+// Heartbeat laenger als LOOP_HEARTBEAT_TIMEOUT_MS ausbleibt. Faengt ein Einfrieren des Loop-Tasks
+// ab (z.B. blockierendes server.handleClient() oder eine lwIP-Verklemmung beim Mischen von
+// synchroner WebServer-Klasse und AsyncTCP), das KEIN Watchdog erkennt: der Loop-Task ist nicht
+// beim TWDT registriert und die IDLE-Task laeuft bei einem blockierenden Hang weiter -> stiller
+// Freeze, bisher nur per Stromstecken behebbar (Befund 2026-06-21: Heap/WiFi gesund, Status-Publish
+// aus dem Loop-Task hoerte auf -> Loop eingefroren). Schwelle deutlich > laengster legitimer
+// Loop-Block: /modbusdump blockiert den Loop bis ~20 s (Semaphore-Wait im HTTP-Handler).
+#define LOOP_HEARTBEAT_TIMEOUT_MS 60000
+
 
 void preTransmission();
 void postTransmission();
@@ -82,6 +93,9 @@ void writeFaultStatusToJson(ArduinoJson::JsonVariant variant);
 // die hier serialisiert ausgefuehrt werden. Das beseitigt die Cross-Task-Bus-Races (Loop-Poller
 // vs. AsyncTCP-Write) und holt das blockierende Busy-Wait aus dem AsyncTCP-Callback.
 void startModbusWorker();
+// Vom Loop-Task jede Iteration aufgerufen: aktualisiert den Heartbeat-Zeitstempel, den der
+// Worker-Task ueberwacht (Selbstheilung bei eingefrorenem Loop-Task, siehe LOOP_HEARTBEAT_TIMEOUT_MS).
+void feedLoopHeartbeat();
 // Reiht einen Schreibbefehl ein (non-blocking, aus jedem Task — z.B. dem MQTT-Callback).
 bool enqueueModbusWrite(const char *register_name, uint16_t value);
 // Fuehrt einen Register-Dump ueber den Worker aus und blockiert den Aufrufer bis Fertig/Timeout.
