@@ -1,15 +1,16 @@
 #ifndef SETUPWEBSERVER_H
 #define SETUPWEBSERVER_H
 
-#if defined(ARDUINO_ARCH_ESP32)
-#include "WebServer.h"
-#elif defined(ARDUINO_ARCH_ESP8266)
-#include <ESP8266WebServer.h>
-#endif
+#include <ESPAsyncWebServer.h>
 
-#include "setupWifiManager.h"
+// Bewusst NICHT setupWifiManager.h einbinden: das zieht WiFiManager -> (synchrone) WebServer.h ->
+// http_parser.h herein, dessen HTTP_GET/HTTP_POST-Enum mit ESPAsyncWebServers AsyncWebRequestMethod
+// kollidiert (mehrdeutig). setupWebserver.cpp forward-deklariert setupWifiManager() stattdessen.
 #include "log.h"
 
+// loopWebserver() bedient NICHT mehr den Webserver (der laeuft jetzt asynchron im AsyncTCP-Task) —
+// es fuehrt nur noch aufgeschobene Aktionen aus (Reboot / Reconfigure), die nicht im AsyncTCP-
+// Handler laufen duerfen. Wird weiter jede Loop-Iteration aufgerufen.
 void loopWebserver();
 void setupWebserver();
 void restartWebserver();

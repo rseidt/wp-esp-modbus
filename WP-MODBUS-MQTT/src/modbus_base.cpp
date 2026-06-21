@@ -643,14 +643,13 @@ enum ModbusReqType
 struct ModbusRequest
 {
 	ModbusReqType type;
-	char name[32];          // WRITE: Registername
-	uint16_t value;         // WRITE: Rohwert
-	uint16_t start;         // DUMP:  Startadresse
-	uint16_t count;         // DUMP:  Anzahl
-	uint16_t *values;       // DUMP:  Zielpuffer (Aufrufer haelt ihn bis done)
-	bool *valid;            // DUMP:  Gueltigkeitsflags
-	volatile bool *ok;      // DUMP:  Ergebnis
-	SemaphoreHandle_t done; // DUMP:  Completion-Signal
+	char name[32];                       // WRITE: Registername
+	uint16_t value;                      // WRITE: Rohwert
+	uint16_t start;                      // DUMP:  Startadresse
+	uint16_t count;                      // DUMP:  Anzahl
+	uint16_t *values;                    // DUMP:  Zielpuffer (interner Dump-Puffer)
+	bool *valid;                         // DUMP:  Gueltigkeitsflags
+	volatile ModbusDumpState *dumpState; // DUMP:  setzt der Worker nach Fertigstellung auf DONE
 };
 
 static QueueHandle_t modbusRequestQueue = nullptr;
@@ -704,40 +703,51 @@ bool enqueueModbusWrite(const char *register_name, uint16_t value)
 	return true;
 }
 
-bool modbusDump(uint16_t start_id, uint16_t count, uint16_t *values, bool *valid, uint32_t timeout_ms)
+// --- Non-blocking Dump-Zustand (vom asynchronen Webserver gepollt) ----------------------
+// Interne Puffer, die der Worker fuellt; der Webserver liest sie bei MB_DUMP_DONE per Accessor.
+// g_dumpState wird vom Worker (Core 0) geschrieben und vom AsyncTCP-Handler (ebenfalls Core 0)
+// gelesen -> volatile genuegt, kein Mutex noetig.
+static volatile ModbusDumpState g_dumpState = MB_DUMP_IDLE;
+static uint16_t g_dumpValues[MODBUS_DUMP_MAX];
+static bool g_dumpValid[MODBUS_DUMP_MAX];
+static uint16_t g_dumpStart = 0;
+static uint16_t g_dumpCount = 0;
+
+bool requestModbusDump(uint16_t start, uint16_t count)
 {
-	if (modbusRequestQueue == nullptr)
+	if (modbusRequestQueue == nullptr || g_dumpState == MB_DUMP_RUNNING)
 	{
-		return false;
+		return false; // kein Worker bzw. ein Dump laeuft schon
 	}
-	// Statisches Completion-Signal (nie geloescht -> kein Use-after-free, falls ein Timeout den
-	// Aufrufer vor dem Worker zuruecklaesst). Der synchrone Webserver ruft das einzeln auf.
-	static SemaphoreHandle_t dumpDone = nullptr;
-	if (dumpDone == nullptr)
+	if (count > MODBUS_DUMP_MAX)
 	{
-		dumpDone = xSemaphoreCreateBinary();
+		count = MODBUS_DUMP_MAX;
 	}
-	xSemaphoreTake(dumpDone, 0); // evtl. Altsignal abraeumen
-	volatile bool ok = false;
+	g_dumpStart = start;
+	g_dumpCount = count;
+	memset(g_dumpValid, 0, sizeof(g_dumpValid)); // Default ungueltig, bis der Worker fuellt
+	g_dumpState = MB_DUMP_RUNNING;
 	ModbusRequest req = {};
 	req.type = MB_REQ_DUMP;
-	req.start = start_id;
+	req.start = start;
 	req.count = count;
-	req.values = values;
-	req.valid = valid;
-	req.ok = &ok;
-	req.done = dumpDone;
-	if (xQueueSend(modbusRequestQueue, &req, pdMS_TO_TICKS(timeout_ms)) != pdTRUE)
+	req.values = g_dumpValues;
+	req.valid = g_dumpValid;
+	req.dumpState = &g_dumpState;
+	if (xQueueSend(modbusRequestQueue, &req, 0) != pdTRUE)
 	{
+		g_dumpState = MB_DUMP_IDLE; // Queue voll -> Zustand zuruecknehmen
 		return false;
 	}
-	if (xSemaphoreTake(dumpDone, pdMS_TO_TICKS(timeout_ms)) != pdTRUE)
-	{
-		log(LOG_LEVEL_ERROR, "Modbus-Dump Timeout");
-		return false;
-	}
-	return ok;
+	return true;
 }
+
+ModbusDumpState modbusDumpState() { return g_dumpState; }
+uint16_t modbusDumpStart() { return g_dumpStart; }
+uint16_t modbusDumpCount() { return g_dumpCount; }
+const uint16_t *modbusDumpValues() { return g_dumpValues; }
+const bool *modbusDumpValid() { return g_dumpValid; }
+void modbusDumpReset() { g_dumpState = MB_DUMP_IDLE; }
 
 static void serviceRequest(const ModbusRequest &req)
 {
@@ -750,14 +760,10 @@ static void serviceRequest(const ModbusRequest &req)
 	}
 	else // MB_REQ_DUMP
 	{
-		bool ok = readHoldingRange(req.start, req.count, req.values, req.valid);
-		if (req.ok != nullptr)
+		readHoldingRange(req.start, req.count, req.values, req.valid); // valid[] traegt das Ergebnis
+		if (req.dumpState != nullptr)
 		{
-			*req.ok = ok;
-		}
-		if (req.done != nullptr)
-		{
-			xSemaphoreGive(req.done);
+			*req.dumpState = MB_DUMP_DONE; // Webserver-Poll sieht jetzt DONE und rendert
 		}
 	}
 }
@@ -802,8 +808,9 @@ static void modbusWorkerTask(void *)
 			{
 				if (req.type == MB_REQ_DUMP)
 				{
-					if (req.ok != nullptr) *req.ok = false;
-					if (req.done != nullptr) xSemaphoreGive(req.done);
+					// Bus gehoert der App -> nicht lesen; Dump als fertig (alle ungueltig) quittieren,
+					// damit der Webserver-Poll nicht in MB_DUMP_RUNNING haengen bleibt.
+					if (req.dumpState != nullptr) *req.dumpState = MB_DUMP_DONE;
 				}
 				else
 				{

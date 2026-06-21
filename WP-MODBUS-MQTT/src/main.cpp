@@ -7,7 +7,8 @@ static char HOSTNAME[12] = "ESP-MM-FFFF";
 static const char __attribute__((__unused__)) *TAG = "Main";
 
 // static const char *FIRMWARE_URL = "https://domain.com/path/file.bin";
-static const char *FIRMWARE_VERSION = "000.000.025";
+// Nicht static: der Webserver (setupWebserver.cpp) zeigt die Version auf der Startseite an (extern).
+const char *FIRMWARE_VERSION = "000.000.026";
 
 // instanciate AsyncMqttClient object
 AsyncMqttClient mqtt_client;
@@ -108,6 +109,10 @@ bool reportMemoryStatus(void *pvParameters)
 	// rssi: WLAN-Signalstaerke in dBm (näher an 0 = besser; < -75 dBm = schwach). Diagnostiziert,
 	// ob Rest-Latenz/Drops trotz WiFi.setSleep(false) an einem schwachen Link liegen.
 	json += "\"rssi\":" + String(WiFi.isConnected() ? WiFi.RSSI() : 0) + ",";
+	// Interner Die-Temperatursensor des ESP32 (temperatureRead() -> Grad C auf Core 3.x). Misst die
+	// Chip-/Die-Temperatur, NICHT die Umgebung (liest auf dem Classic-ESP32 erfahrungsgemaess hoch);
+	// dient der Ueberwachung von thermischem Stress, nicht als Raumtemperatur.
+	json += "\"internalTemp\":" + String(temperatureRead(), 1) + ",";
 	// Flap-Zaehler seit Boot: steigen sie synchron mit zunehmender Traegheit -> Link instabil.
 	json += "\"mqttDisconnects\":" + String(mqttDisconnectCount) + ",";
 	json += "\"wifiDisconnects\":" + String(wifiDisconnectCount) + ",";

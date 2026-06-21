@@ -98,8 +98,27 @@ void startModbusWorker();
 void feedLoopHeartbeat();
 // Reiht einen Schreibbefehl ein (non-blocking, aus jedem Task — z.B. dem MQTT-Callback).
 bool enqueueModbusWrite(const char *register_name, uint16_t value);
-// Fuehrt einen Register-Dump ueber den Worker aus und blockiert den Aufrufer bis Fertig/Timeout.
-bool modbusDump(uint16_t start_id, uint16_t count, uint16_t *values, bool *valid, uint32_t timeout_ms);
+
+// --- Non-blocking Register-Dump fuer den asynchronen Webserver -------------------------
+// Frueher blockierte modbusDump() den Aufrufer bis zu 20 s auf eine Semaphore — im AsyncTCP-
+// Handler (ESPAsyncWebServer) verboten. Jetzt: requestModbusDump() reiht einen Dump ein und
+// kehrt sofort zurueck; der Worker fuellt interne Puffer und setzt den Status auf MB_DUMP_DONE.
+// Der Webserver pollt modbusDumpState() (Auto-Refresh-Seite) und rendert bei DONE aus den
+// Accessor-Puffern, dann modbusDumpReset() -> der naechste Aufruf startet einen frischen Dump.
+#define MODBUS_DUMP_MAX 201 // max. Registeranzahl pro Dump (statischer Puffer im Worker)
+enum ModbusDumpState
+{
+	MB_DUMP_IDLE,
+	MB_DUMP_RUNNING,
+	MB_DUMP_DONE
+};
+bool requestModbusDump(uint16_t start, uint16_t count); // false, wenn schon laufend oder Queue voll
+ModbusDumpState modbusDumpState();
+uint16_t modbusDumpStart();
+uint16_t modbusDumpCount();
+const uint16_t *modbusDumpValues();
+const bool *modbusDumpValid();
+void modbusDumpReset(); // nach dem Rendern: Status zurueck auf IDLE
 // loop() pollt das: liefert einmal true, nachdem der Worker neue Daten bereitgestellt hat
 // (voller Poll-Zyklus oder bestaetigter Write) -> publishModbusData() laeuft so im Loop-Task.
 bool consumeModbusPublishRequest();
