@@ -11,3 +11,9 @@ resources/modbus-scans
 .clang_complete
 .gcc-flags.json
 .pio
+
+# Von pioarduino bei custom_sdkconfig (From-Source-Build) erzeugte Build-Artefakte
+sdkconfig.defaults
+sdkconfig.*
+.dummy
+managed_components

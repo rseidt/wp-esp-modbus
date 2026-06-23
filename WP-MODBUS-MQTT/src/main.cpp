@@ -8,7 +8,7 @@ static const char __attribute__((__unused__)) *TAG = "Main";
 
 // static const char *FIRMWARE_URL = "https://domain.com/path/file.bin";
 // Nicht static: der Webserver (setupWebserver.cpp) zeigt die Version auf der Startseite an (extern).
-const char *FIRMWARE_VERSION = "000.000.026";
+const char *FIRMWARE_VERSION = "000.000.027";
 
 // instanciate AsyncMqttClient object
 AsyncMqttClient mqtt_client;

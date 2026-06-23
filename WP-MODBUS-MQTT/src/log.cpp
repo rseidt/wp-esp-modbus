@@ -3,6 +3,7 @@
 #include <LittleFS.h>
 #include <time.h>
 #include <esp_system.h>
+#include <esp_core_dump.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -102,6 +103,30 @@ static void trimCurrentLog()
 	LittleFS.rename(FILE_LOG_PATH_TMP, FILE_LOG_PATH_CURRENT);
 }
 
+// Kopiert eine Datei chunkweise (ohne grosse RAM-Allokation). Genutzt fuer die Crash-Log-Sicherung.
+static void copyFile(const char *src, const char *dst)
+{
+	File in = LittleFS.open(src, "r");
+	if (!in)
+	{
+		return;
+	}
+	File out = LittleFS.open(dst, "w");
+	if (!out)
+	{
+		in.close();
+		return;
+	}
+	uint8_t buf[512];
+	size_t n;
+	while ((n = in.read(buf, sizeof(buf))) > 0)
+	{
+		out.write(buf, n);
+	}
+	in.close();
+	out.close();
+}
+
 void initFileLog(const char *firmwareVersion)
 {
 	if (logMutex == nullptr)
@@ -113,6 +138,19 @@ void initFileLog(const char *firmwareVersion)
 	{
 		Serial.println("[1]: initFileLog: LittleFS mount failed, file logging disabled");
 		return;
+	}
+
+	// Crash-Log sichern, BEVOR rotiert wird: war der letzte Reset ein Absturz (Panic/Watchdog/
+	// Brownout), die Breadcrumbs der abgestuerzten Session (= aktuelles /log.txt) in die nicht
+	// rotierte /log_crash.txt kopieren. Sonst schiebt schon der naechste (Auto-)Reboot oder ein
+	// Power-Cycle den Crash-Kontext aus current/previous heraus (Befund 2026-06-21). /log/crash
+	// haelt damit IMMER die letzte abgestuerzte Session, ueberlebt beliebig viele Reboots.
+	esp_reset_reason_t rr = esp_reset_reason();
+	bool wasCrash = (rr == ESP_RST_PANIC || rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT ||
+					 rr == ESP_RST_WDT || rr == ESP_RST_BROWNOUT);
+	if (wasCrash && LittleFS.exists(FILE_LOG_PATH_CURRENT))
+	{
+		copyFile(FILE_LOG_PATH_CURRENT, FILE_LOG_PATH_CRASH);
 	}
 
 	// Rotation: Log des vorherigen Boots als "pre-restart" sichern, dann frisch beginnen.
@@ -136,6 +174,13 @@ void initFileLog(const char *firmwareVersion)
 		f.println("===== BOOT " + logTimestamp() + " =====");
 		f.println("Firmware " + String(firmwareVersion) + " (compiled " + __DATE__ + " " + __TIME__ + ")");
 		f.println("Reset reason: " + String(resetReasonStr()));
+		// Coredump-Hinweis ins Boot-Banner: liegt nach einem Panic ein Flash-Coredump vor, hier
+		// vermerken, damit der Crash-Workflow (Datei-Log -> /coredump) direkt sichtbar verknuepft ist.
+		size_t cdAddr = 0, cdSize = 0;
+		if (esp_core_dump_image_get(&cdAddr, &cdSize) == ESP_OK && cdSize > 0)
+		{
+			f.println("Coredump: vorhanden (" + String((unsigned)cdSize) + " Bytes) -> Backtrace unter /coredump");
+		}
 		f.close();
 	}
 	fileLogReady = true;

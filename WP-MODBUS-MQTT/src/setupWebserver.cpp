@@ -2,6 +2,8 @@
 #include "modbus_base.h"
 #include <LittleFS.h>
 #include <Update.h>
+#include <esp_core_dump.h>
+#include <esp_partition.h>
 
 // In main.cpp definiert — Umschaltung App-/MQTT-Steuerung inkl. WBR3_EN_PIN und Modbus-Poll.
 void setControlMode(bool appControl);
@@ -51,6 +53,18 @@ static String hex4(uint16_t value)
 	return s;
 }
 
+// 8-stelliges Grossbuchstaben-Hex mit fuehrenden Nullen (fuer 32-Bit-Adressen, z.B. Coredump-PC).
+static String hex8(uint32_t value)
+{
+	String s = String(value, HEX);
+	s.toUpperCase();
+	while (s.length() < 8)
+	{
+		s = "0" + s;
+	}
+	return s;
+}
+
 // 16-stellige Binaerdarstellung mit fuehrenden Nullen.
 static String bin16(uint16_t value)
 {
@@ -73,6 +87,7 @@ void handleRoot(AsyncWebServerRequest *request)
 	content += "<p>Click <a href=\"/modbusdump\">here</a> to create a Modbus register dump (0..200).</p>";
 	content += "<p>Click <a href=\"/control\">here</a> to switch control mode (Hersteller-App / MQTT).</p>";
 	content += "<p>Click <a href=\"/logs\">here</a> to view logs.</p>";
+	content += "<p>Click <a href=\"/coredump\">here</a> to view the last crash coredump (Panic backtrace).</p>";
 	content += "<p>Click <a href=\"/reboot\">here</a> to reboot the ESP.</p>";
 	content += "<hr><p><small>Firmware version: " + String(FIRMWARE_VERSION) + "</small></p>";
 	content += "</body></html>";
@@ -157,6 +172,8 @@ void handleLogs(AsyncWebServerRequest *request)
 	content += "<p>INFO/DEBUG nur kurz fuer Diagnose nutzen (Flash-Verschleiss).</p>";
 	content += "<hr><p><a href=\"/log/current\">Aktuelles Log anzeigen</a></p>";
 	content += "<p><a href=\"/log/previous\">Log vor letztem Reboot (pre-restart) anzeigen</a></p>";
+	content += "<p><a href=\"/log/crash\">Letztes Crash-Log (Panic/Watchdog) anzeigen</a></p>";
+	content += "<p><a href=\"/coredump\">Letzten Coredump (Panic-Backtrace) anzeigen</a></p>";
 	content += "<p><a href=\"/\">Home</a></p></body></html>";
 	request->send(200, "text/html", content);
 }
@@ -352,6 +369,136 @@ void handleReboot(AsyncWebServerRequest *request)
 	request->send(200, "text/html", content);
 }
 
+// ---------------------------------------------------------------------------
+// Coredump (Flash). Bei einem Panic schreibt der IDF-Panic-Handler einen ELF-Coredump in die
+// coredump-Partition (aktiviert via custom_sdkconfig in platformio.ini). Da der ESP verbaut ist
+// (kein Serial), wird der Crash-Kontext hier per HTTP abgeholt — analog zum Datei-Log:
+//   GET  /coredump        -> menschenlesbare Zusammenfassung (PC, Task, Backtrace-Adressen)
+//   GET  /coredump.elf    -> Roh-ELF zum Offline-Dekodieren (espcoredump.py / addr2line)
+//   POST /coredump/erase  -> Partition loeschen, damit der naechste Crash frisch erfasst wird
+// esp_core_dump_image_get()/_erase() sind auch ohne aktivierten Coredump verfuegbar; _check() und
+// get_summary() NUR mit FLASH+ELF (per #if gesichert). Ohne Coredump-Config (vorkompilierter Core,
+// TO_NONE) wird der ganze Summary-Block weggelassen — _image_get() meldet dann ohnehin "kein Dump".
+
+// SHA256 (als Bytes gespeichert) in Hex-String — zum Abgleich, dass die firmware.elf zum Dump passt.
+static String coredumpShaHex(const uint8_t *sha, size_t n)
+{
+	String s;
+	char b[3];
+	for (size_t i = 0; i < n; ++i)
+	{
+		snprintf(b, sizeof(b), "%02X", sha[i]);
+		s += b;
+	}
+	return s;
+}
+
+void handleCoredump(AsyncWebServerRequest *request)
+{
+	size_t addr = 0, size = 0;
+	esp_err_t imgErr = esp_core_dump_image_get(&addr, &size);
+
+	String c = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+	c += "<link rel=\"icon\" href=\"data:,\"><style>body{font-family:Arial;text-align:center;}";
+	c += "pre,code{text-align:left;background:#f0f0f0;padding:.6em;display:inline-block;word-break:break-all;}</style>";
+	c += "</head><body><h1>Coredump</h1>";
+
+	if (imgErr != ESP_OK || size == 0)
+	{
+		c += "<p><b>Kein Coredump gespeichert.</b> (Seit dem letzten Loeschen/Flashen kein Panic erfasst.)</p>";
+		c += "<p><a href=\"/logs\">Logs</a> | <a href=\"/\">Home</a></p></body></html>";
+		request->send(200, "text/html", c);
+		return;
+	}
+
+	c += "<p>Gespeicherter Coredump: <b>" + String((unsigned)size) + " Bytes</b> @ 0x" + hex8((uint32_t)addr) + "</p>";
+
+#if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH && CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF
+	c += "<p>Integritaet: <b>" + String(esp_core_dump_image_check() == ESP_OK ? "OK" : "KORRUPT (Pruefsumme)") + "</b></p>";
+	esp_core_dump_summary_t *sum = (esp_core_dump_summary_t *)malloc(sizeof(esp_core_dump_summary_t));
+	if (sum && esp_core_dump_get_summary(sum) == ESP_OK)
+	{
+		String bt;
+		c += "<pre>";
+		c += "Crashed task : " + String(sum->exc_task) + "\n";
+		c += "Exception PC : 0x" + hex8(sum->exc_pc) + "\n";
+		c += "exc_cause    : " + String(sum->ex_info.exc_cause) + "\n";
+		c += "exc_vaddr    : 0x" + hex8(sum->ex_info.exc_vaddr) + "\n";
+		c += "App SHA256   : " + coredumpShaHex(sum->app_elf_sha256, APP_ELF_SHA256_SZ) + "\n";
+		c += "Backtrace " + String(sum->exc_bt_info.corrupted ? "(corrupt!) " : "") + ":\n";
+		for (uint32_t i = 0; i < sum->exc_bt_info.depth && i < 16; ++i)
+		{
+			String a = hex8(sum->exc_bt_info.bt[i]);
+			c += "  0x" + a + "\n";
+			bt += "0x" + a + " ";
+		}
+		c += "</pre>";
+		c += "<p>Offline dekodieren (passende firmware.elf vorausgesetzt — SHA oben pruefen):</p>";
+		c += "<code>xtensa-esp32-elf-addr2line -pfiaC -e .pio/build/ESP32_dev_kit/firmware.elf 0x" + hex8(sum->exc_pc) + " " + bt + "</code>";
+	}
+	else
+	{
+		c += "<p>Zusammenfassung nicht lesbar (Dump evtl. korrupt) — Roh-ELF unten laden.</p>";
+	}
+	free(sum);
+#else
+	c += "<p>Summary-API nicht einkompiliert (CONFIG_ESP_COREDUMP_* fehlt).</p>";
+#endif
+
+	c += "<hr><p><a href=\"/coredump.elf\">Roh-ELF herunterladen</a> (espcoredump.py info_corefile -t elf -c coredump.elf firmware.elf)</p>";
+	c += "<form method='POST' action='/coredump/erase' onsubmit=\"return confirm('Coredump wirklich loeschen?');\">";
+	c += "<input type='submit' value='Coredump loeschen'></form>";
+	c += "<p><a href=\"/logs\">Logs</a> | <a href=\"/\">Home</a></p></body></html>";
+	request->send(200, "text/html", c);
+}
+
+// Roh-ELF-Download. Streamt die coredump-Partition stueckweise (chunked) — der Flash-Read ist kurz
+// und im AsyncTCP-Task ebenso unkritisch wie der OTA-Update.write(). Der Dump liegt ab Partitionsoffset 0.
+void handleCoredumpDownload(AsyncWebServerRequest *request)
+{
+	size_t addr = 0, size = 0;
+	if (esp_core_dump_image_get(&addr, &size) != ESP_OK || size == 0)
+	{
+		request->send(404, "text/plain", "Kein Coredump gespeichert.");
+		return;
+	}
+	const esp_partition_t *part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, NULL);
+	if (!part)
+	{
+		request->send(500, "text/plain", "coredump-Partition nicht gefunden.");
+		return;
+	}
+	AsyncWebServerResponse *resp = request->beginChunkedResponse(
+		"application/octet-stream",
+		[part, size](uint8_t *buffer, size_t maxLen, size_t index) -> size_t
+		{
+			if (index >= size)
+			{
+				return 0;
+			}
+			size_t toRead = (size - index < maxLen) ? (size - index) : maxLen;
+			if (esp_partition_read(part, index, buffer, toRead) != ESP_OK)
+			{
+				return 0;
+			}
+			return toRead;
+		});
+	resp->addHeader("Content-Disposition", "attachment; filename=\"coredump.elf\"");
+	request->send(resp);
+}
+
+void handleCoredumpErase(AsyncWebServerRequest *request)
+{
+	esp_err_t err = esp_core_dump_image_erase();
+	log(LOG_LEVEL_WARNING, "Coredump via web geloescht (err=" + String(err) + ")");
+	String c = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+	c += "<link rel=\"icon\" href=\"data:,\"><style>body{font-family:Arial;text-align:center;}</style>";
+	c += "</head><body><h1>Coredump</h1>";
+	c += "<p>" + String(err == ESP_OK ? "Coredump geloescht." : "Loeschen fehlgeschlagen (err=" + String(err) + ").") + "</p>";
+	c += "<p><a href=\"/coredump\">Zurueck</a> | <a href=\"/\">Home</a></p></body></html>";
+	request->send(200, "text/html", c);
+}
+
 // Fuehrt aufgeschobene Aktionen aus dem Loop-Task aus (nicht aus dem AsyncTCP-Handler): Reboot bzw.
 // Reconfigure. Bedient KEINEN Webserver mehr (der laeuft asynchron). Wird jede Loop-Iteration gerufen.
 void loopWebserver()
@@ -386,6 +533,11 @@ void setupWebserver()
 			  { sendLogFile(request, FILE_LOG_PATH_CURRENT); });
 	server.on("/log/previous", HTTP_GET, [](AsyncWebServerRequest *request)
 			  { sendLogFile(request, FILE_LOG_PATH_PREVIOUS); });
+	server.on("/log/crash", HTTP_GET, [](AsyncWebServerRequest *request)
+			  { sendLogFile(request, FILE_LOG_PATH_CRASH); });
+	server.on("/coredump", HTTP_GET, handleCoredump);
+	server.on("/coredump.elf", HTTP_GET, handleCoredumpDownload);
+	server.on("/coredump/erase", HTTP_POST, handleCoredumpErase);
 	server.on(
 		"/uploadFirmware", HTTP_POST,
 		[](AsyncWebServerRequest *request)

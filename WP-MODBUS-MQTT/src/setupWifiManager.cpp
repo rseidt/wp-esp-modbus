@@ -117,6 +117,13 @@ void setupWifiManager(bool forceConfigPortal)
 	// in seconds
 	// wifiManager.setTimeout(120);
 
+	// Portal NICHT endlos blockieren: ohne Timeout haengt autoConnect in setup() fuer immer im
+	// AP-Modus, wenn die STA-Verbindung scheitert (z.B. nach einem Crash-Reboot) -> ESP unter der
+	// LAN-IP unerreichbar, nur per Power-Cycle behebbar (Befund 2026-06-21: Session nach Panic-Reboot
+	// kam nie ueber autoConnect hinaus, kein "local ip"). Mit Timeout kehrt autoConnect nach 180 s
+	// mit false zurueck -> der ESP.restart() unten greift -> erneuter STA-Versuch (Selbstheilung).
+	wifiManager.setConfigPortalTimeout(180);
+
 	// fetches ssid and pass and tries to connect
 	// if it does not connect it starts an access point with the specified name
 	// here  "AutoConnectAP"

@@ -17,6 +17,10 @@
 #define FILE_LOG_PATH_CURRENT  "/log.txt"
 #define FILE_LOG_PATH_PREVIOUS "/log_prev.txt"
 #define FILE_LOG_PATH_TMP      "/log.tmp"
+// Crash-Log: NICHT rotiert. Beim Boot nach einem Absturz (Panic/Watchdog/Brownout) wird die
+// abgestuerzte Session hierher kopiert, damit der Crash-Kontext NICHT vom naechsten Reboot oder
+// Power-Cycle aus current/previous geschoben wird (Befund 2026-06-21: doppelter Boot loeschte ihn).
+#define FILE_LOG_PATH_CRASH    "/log_crash.txt"
 #define FILE_LOG_MAX_BYTES     32768  // Kappung je Datei; bei Ueberlauf werden die aeltesten Zeilen verworfen
 
 // Datei-Log-Level, UNABHAENGIG von MAX_LOG_LEVEL (Serial). Zur Laufzeit ueber /logs umschaltbar,
