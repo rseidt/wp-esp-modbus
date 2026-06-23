@@ -9,21 +9,11 @@
 // Kein Strapping-/Input-Only-Pin (siehe CLAUDE.md).
 #define WBR3_EN_PIN 21
 
-#include <math.h>
-#if defined(ARDUINO_ARCH_ESP32)
 #include <WiFi.h>
-#include <ESPmDNS.h>
-// #include "esp32-hal-log.h"
-#elif defined(ARDUINO_ARCH_ESP8266)
-#include <ESP8266WiFi.h>
-#include <ESP8266mDNS.h>
-#endif
 
 #include <ArduinoJson.h>
 #include <AsyncMqttClient.h>
-#include <WiFiManager.h>
 #include <arduino-timer.h>
-#include <Url.h>
 #include "log.h"
 #include "setupWebserver.h"
 #include "setupWifiManager.h"

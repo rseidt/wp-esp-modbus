@@ -9,7 +9,6 @@
 #define MAX_LOG_LEVEL 2 // Change this to set the maximum log level (Serial-Ausgabe)
 
 #include "Arduino.h"
-#include "modbus_registers.h"
 
 // Persistentes Logging ins LittleFS (zusaetzlich zum Serial). Zwei Dateien: das aktuelle Log
 // des laufenden Boots und das des vorherigen Boots ("pre-restart"), das beim Boot durch

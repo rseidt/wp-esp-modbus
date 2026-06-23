@@ -3,7 +3,6 @@
 #include <LittleFS.h>
 #include <time.h>
 #include <esp_system.h>
-#include <esp_core_dump.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -174,13 +173,6 @@ void initFileLog(const char *firmwareVersion)
 		f.println("===== BOOT " + logTimestamp() + " =====");
 		f.println("Firmware " + String(firmwareVersion) + " (compiled " + __DATE__ + " " + __TIME__ + ")");
 		f.println("Reset reason: " + String(resetReasonStr()));
-		// Coredump-Hinweis ins Boot-Banner: liegt nach einem Panic ein Flash-Coredump vor, hier
-		// vermerken, damit der Crash-Workflow (Datei-Log -> /coredump) direkt sichtbar verknuepft ist.
-		size_t cdAddr = 0, cdSize = 0;
-		if (esp_core_dump_image_get(&cdAddr, &cdSize) == ESP_OK && cdSize > 0)
-		{
-			f.println("Coredump: vorhanden (" + String((unsigned)cdSize) + " Bytes) -> Backtrace unter /coredump");
-		}
 		f.close();
 	}
 	fileLogReady = true;

@@ -5,24 +5,16 @@
 
 #include <ModbusMaster.h>
 #include <ArduinoJson.h>
-#ifndef ARDUINO_ARCH_ESP32
-#include <SoftwareSerial.h>
-#endif
 #include "modbus_registers.h"
 #include "log.h"
 #include "Arduino.h"
 
 
 // TODO: add this to WifiManager
-#if defined(ARDUINO_ARCH_ESP32)
 // RX/TX getauscht (2026-06-14): nach Wechsel HW-519 -> MAX3485-Modul kamen keine Daten;
 // dessen RXD/TXD-Silkscreen ist aus Modul-Sicht beschriftet -> Pins gegenueber vorher vertauscht.
 #define RXD 17 // aka D17
 #define TXD 16 // aka D16
-#elif defined(ARDUINO_ARCH_ESP8266)
-#define RXD 14 // aka D5
-#define TXD 12 // aka D6
-#endif
 // Richtungssteuerung des MAX3485-Moduls ("RS485 V2.0", EN-Pin = DE+/RE zusammengelegt)
 // an GPIO 22. preTransmission()=HIGH (senden), postTransmission()=LOW (empfangen);
 // Init auf Empfang in initModbus(). Ersetzt das alte HW-519-Auto-Direction-Modul, dessen

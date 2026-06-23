@@ -348,13 +348,9 @@ void setup()
 	setupWifiManager(false);
 	setupWebserver();
 
-#if defined(ARDUINO_ARCH_ESP32)
 	uint64_t fullMAC = ESP.getEfuseMac();
-    uint32_t chipID = fullMAC & 0xFFFFFFFF; // Extract the lower 32 bits
+	uint32_t chipID = fullMAC & 0xFFFFFFFF; // Extract the lower 32 bits
 	snprintf(HOSTNAME, sizeof(HOSTNAME), "ESP-MM-%X", chipID);
-#elif defined(ARDUINO_ARCH_ESP8266)
-	snprintf(HOSTNAME, sizeof(HOSTNAME), "ESP-MM-%X", ESP.getChipId());
-#endif
 
 	log(LOG_LEVEL_INFO, "*********************************************************************");
 	log(LOG_LEVEL_INFO, "Firmware version " + String(FIRMWARE_VERSION) + " (compiled at " + __DATE__ + " " + __TIME__ + ")");

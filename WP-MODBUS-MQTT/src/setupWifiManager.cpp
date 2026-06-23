@@ -38,12 +38,7 @@ void setupWifiManager(bool forceConfigPortal)
 
 	// read configuration from FS json
 	log(LOG_LEVEL_INFO, "mounting FS...");
-	bool fsOk = false;
-#if defined(ARDUINO_ARCH_ESP32)
-	fsOk = LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED);
-#elif defined(ARDUINO_ARCH_ESP8266)
-	fsOk = LittleFS.begin();
-#endif
+	bool fsOk = LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED);
 	if (!fsOk)
 	{
 		log(LOG_LEVEL_ERROR, "LittleFS Mount Failed");

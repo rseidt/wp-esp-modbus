@@ -57,13 +57,8 @@ bool isTransientModbusError(uint8_t result)
 		|| result == ModbusMaster::ku8MBInvalidFunction;
 }
 
-// The ESP32 has 3 hardware serial ports, the ESP8266 has only 1 which we use for debugging.
-// So we do the modbus communication over Software Serial.
-#ifdef ARDUINO_ARCH_ESP32
+// Der ESP32 hat 3 Hardware-UARTs; UART2 dient der Modbus-Kommunikation (UART0 = Debug/Serial).
 HardwareSerial modbusSerial(2); // Use UART2
-#else
-SoftwareSerial modbusSerial(RXD, TXD); // RX, TX
-#endif
 
 #if MODBUS_BAUDRATE > 19200
     uint32_t t3_5 = 1750;
@@ -106,9 +101,7 @@ void initModbus()
 
 	register_values = new uint16_t[num_registers];
 	modbusSerial.begin(MODBUS_BAUDRATE); // Using ESP32 UART2 for Modbus
-	#ifdef ARDUINO_ARCH_ESP32
 	modbusSerial.setPins(RXD, TXD);
-	#endif
 	modbus_client.begin(MODBUS_UNIT, modbusSerial);
 	// do we have a flow control pin?
 	if (RTS != NOT_A_PIN)
